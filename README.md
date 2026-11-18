@@ -67,6 +67,44 @@ sudo alwayson approvals
 
 查看实际参数后，用 `sudo alwayson approve APPROVAL_ID` 批准，或用 `sudo alwayson reject APPROVAL_ID` 拒绝。批准的跟进从批准时开始计算延时。批准或拒绝都会进入同一会话的事件队列。长期记忆也使用这套审批流程。用 `memory` 查看已保存条目，用 `forget KEY` 删除一条。
 
+## 让 Agent 每三天巡检一个个人 GitHub 仓库
+
+建好或升级服务后，在 GitHub 创建一个 **fine-grained personal access token**。Resource owner 选择你自己的个人账号，Repository access 只选择目标仓库。Repository permissions 选 `Issues: Read-only`、`Contents: Read and write`、`Pull requests: Read and write`，`Metadata: Read-only` 会默认提供。请确认目标仓库的 GitHub 套餐支持 Draft PR。 [GitHub Token 文档](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) · [Draft PR API](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)
+
+```bash
+sudoedit /etc/alwayson/github_token
+sudoedit /etc/alwayson/github.conf
+sudo systemctl restart alwayson
+```
+
+Token 文件只填一行 Token 本身。配置示例中的 `your-user/your-repo` 换成你自己的仓库。把允许 Claude 读取和修改的目录写成带尾部 `/` 的仓库相对路径，也可以列出单个文件。下面是示例，默认随包配置只包含 `README.md` 和 `docs/`。
+
+```ini
+ALWAYSON_GITHUB_REPO=your-user/your-repo
+ALWAYSON_GITHUB_LABEL=agent-ready
+ALWAYSON_GITHUB_PATHS=README.md,docs/,src/,tests/
+```
+
+在目标仓库给愿意让 Agent 处理的开放 issue 加上 `agent-ready` 标签。Agent 会从较早的候选里选择一个尚未分派的 issue。若仓库已经用 `good first issue` 标记类似任务，可以修改配置中的候选标签。
+
+```bash
+sudo alwayson github-run
+sudo alwayson outbox --session github
+```
+
+`github-run` 默认只生成 diff 预览。确认后可设置每三天一次的任务，默认首次在一分钟后。
+
+```bash
+sudo alwayson github-schedule --in 1m --every 3d
+sudo alwayson timers
+```
+
+`github-run --apply` 可立即执行一次实际发布。每个周期最多创建一个 Draft PR，分支名为 `alwayson/issue-编号`。Agent 会把结果或跳过原因写到 `github` 会话的发件箱。用 `cancel-timer ID` 停止计划。周期任务、生成过程和 issue 去重使用同一个 PostgreSQL 数据库。
+
+**个人仓库限制**在读 issue 前和发布 PR 前生效。Agent 核对 Token 用户与个人仓库所有者、仓库协作者、贡献者列表、历史 PR 作者及可见分支的提交历史。检测到其他账号、匿名提交、共同作者、fork，或无法完整核验时会跳过。已归档或关闭 Issues 的仓库也会跳过。 [GitHub 协作者 API](https://docs.github.com/en/rest/collaborators/collaborators#list-repository-collaborators) · [GitHub 贡献者 API](https://docs.github.com/en/rest/repos/repos#list-repository-contributors)
+
+**改动范围**限于配置目录中的小型现有文本文件，每次最多三个文件。程序校验替换是否精确以及生成的 Python 代码能否解析。Draft PR 由你查看 diff 和仓库 CI 后决定是否合并。相关 issue 文本和配置范围内实际读取的源码会送给 Anthropic。如果仓库规则限制创建分支或 Draft PR，失败原因会进入发件箱。 [GitHub Git 数据库 API](https://docs.github.com/en/rest/git)
+
 ## PostgreSQL 怎么保存状态
 
 | Anthropic 原文组件 | 本项目实现 |

@@ -47,7 +47,19 @@ CREATE TABLE IF NOT EXISTS timers (
     body TEXT NOT NULL,
     due_at BIGINT NOT NULL,
     interval_seconds INTEGER,
+    event_kind TEXT NOT NULL DEFAULT 'timer',
     status TEXT NOT NULL DEFAULT 'active'
+);
+ALTER TABLE timers ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'timer';
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_github_schedule ON timers(event_kind)
+    WHERE event_kind = 'github' AND status = 'active';
+CREATE TABLE IF NOT EXISTS github_issues (
+    repo TEXT NOT NULL,
+    issue BIGINT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('skipped', 'published')),
+    pr_url TEXT,
+    PRIMARY KEY (repo, issue)
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -154,14 +166,19 @@ def enqueue(db, kind, session, body, timestamp, dedupe=None, timer_id=None):
     return existing["id"]
 
 
-def add_timer(db, session, body, due, interval=None):
+def add_timer(db, session, body, due, interval=None, kind='timer'):
     db.execute("SELECT pg_advisory_xact_lock(349811, 2)")
+    if kind == "github" and db.execute(
+        "SELECT 1 FROM timers WHERE event_kind = 'github' AND status = 'active'"
+    ).fetchone():
+        raise ValueError("已有 GitHub 定时任务，请先取消它")
     active = db.execute("SELECT COUNT(*) AS count FROM timers WHERE status = 'active'").fetchone()["count"]
     if active >= MAX_TIMERS:
         raise ValueError(f"最多允许 {MAX_TIMERS} 个活动定时器")
     return db.execute(
-        "INSERT INTO timers(session, body, due_at, interval_seconds) VALUES (%s, %s, %s, %s) RETURNING id",
-        (session, body, due, interval),
+        """INSERT INTO timers(session, body, due_at, interval_seconds, event_kind)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (session, body, due, interval, kind),
     ).fetchone()["id"]
 
 
@@ -193,8 +210,8 @@ def tick(db, timestamp):
             ).fetchone()
             if not pending:
                 enqueue(
-                    db, "timer", timer["session"], timer["body"], timestamp,
-                    f"timer:{timer['id']}:{timer['due_at']}", timer["id"],
+                    db, timer["event_kind"], timer["session"], timer["body"], timestamp,
+                    dedupe=f"timer:{timer['id']}:{timer['due_at']}", timer_id=timer["id"],
                 )
             interval = timer["interval_seconds"]
             if interval is None:
@@ -301,8 +318,16 @@ def save_checkpoint(db, event_id, state, timestamp):
     )
 
 
-def save_run(db, event, reply, progress, proposals, timestamp):
+def save_run(db, event, reply, progress, proposals, timestamp, github_result=None):
     with transaction(db):
+        if github_result:
+            db.execute(
+                """INSERT INTO github_issues(repo, issue, fingerprint, status, pr_url)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT(repo, issue) DO UPDATE SET fingerprint = excluded.fingerprint,
+                       status = excluded.status, pr_url = excluded.pr_url""",
+                github_result,
+            )
         if progress is not None:
             db.execute(
                 """INSERT INTO progress(session, value, updated_at) VALUES (%s, %s, %s)

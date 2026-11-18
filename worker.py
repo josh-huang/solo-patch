@@ -250,6 +250,16 @@ def consume(db, state, event, result, last_round):
     raise ApiError("Claude 返回了当前运行器无法处理的结束状态。")
 
 
+def metered_call(db, config, call, version, request):
+    day = store.utc_day(store.now())
+    if not store.reserve_request(db, day, config["daily_requests"]):
+        raise QuotaExhausted
+    result = call(version, request)
+    if isinstance(result.get("usage"), dict):
+        store.add_usage(db, day, result["usage"])
+    return result
+
+
 def run_event(db, event, config, call, stopping=lambda: False):
     state = store.load_checkpoint(db, event["id"])
     if state is None:
@@ -260,9 +270,6 @@ def run_event(db, event, config, call, stopping=lambda: False):
     while state["reply"] is None:
         if stopping():
             return False
-        day = store.utc_day(store.now())
-        if not store.reserve_request(db, day, config["daily_requests"]):
-            raise QuotaExhausted
         last_round = state["rounds"] + 1 >= state["max_rounds"]
         request = {
             "model": state["model"], "max_tokens": state["max_tokens"],
@@ -270,11 +277,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
         }
         if last_round:
             request["tool_choice"] = {"type": "none"}
-        result = call(state["api_version"], request)
-        usage = result.get("usage")
-        with store.transaction(db):
-            if isinstance(usage, dict):
-                store.add_usage(db, day, usage)
+        result = metered_call(db, config, call, state["api_version"], request)
         consume(db, state, event, result, last_round)
         state["rounds"] += 1
         store.save_checkpoint(db, event["id"], state, store.now())
@@ -283,6 +286,8 @@ def run_event(db, event, config, call, stopping=lambda: False):
 
 
 def serve(db):
+    import github_tasks
+
     config = {
         "model": key_value(os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)),
         "api_version": os.environ.get("ANTHROPIC_API_VERSION", API_VERSION),
@@ -312,7 +317,8 @@ def serve(db):
             time.sleep(2)
             continue
         try:
-            finished = run_event(
+            run = github_tasks.run_event if event["kind"] == "github" else run_event
+            finished = run(
                 db, event, config, lambda version, request: call_claude(api_key, version, request),
                 lambda: stopping,
             )

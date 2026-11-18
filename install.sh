@@ -12,7 +12,7 @@ if [[ ! -d /run/systemd/system ]] || ! command -v apt-get >/dev/null; then
 fi
 
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-for file in alwayson.py store.py worker.py alwayson-cli alwayson.service alwayson.conf; do
+for file in alwayson.py store.py worker.py github_tasks.py github.conf alwayson-cli alwayson.service alwayson.conf; do
     if [[ ! -f "$source_dir/$file" ]]; then
         echo "安装包中缺少 $file" >&2
         exit 1
@@ -50,7 +50,7 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'alwayson') \gexec
 SQL
 
 install -d -m 0755 /opt/alwayson /usr/local/bin
-install -m 0644 "$source_dir/alwayson.py" "$source_dir/store.py" "$source_dir/worker.py" /opt/alwayson
+install -m 0644 "$source_dir/alwayson.py" "$source_dir/store.py" "$source_dir/worker.py" "$source_dir/github_tasks.py" /opt/alwayson
 install -m 0755 "$source_dir/alwayson-cli" /usr/local/bin/alwayson
 install -m 0644 "$source_dir/alwayson.service" /etc/systemd/system/alwayson.service
 install -d -m 0700 /etc/alwayson
@@ -60,6 +60,13 @@ if [[ ! -e /etc/alwayson/alwayson.conf ]]; then
 fi
 if [[ ! -e /etc/alwayson/anthropic_api_key ]]; then
     install -m 0600 /dev/null /etc/alwayson/anthropic_api_key
+fi
+
+if [[ ! -e /etc/alwayson/github.conf ]]; then
+    install -m 0600 "$source_dir/github.conf" /etc/alwayson/github.conf
+fi
+if [[ ! -e /etc/alwayson/github_token ]]; then
+    install -m 0600 /dev/null /etc/alwayson/github_token
 fi
 
 /usr/local/bin/alwayson init-db

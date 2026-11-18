@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.dump
+anthropic_api_key
+github_token

@@ -89,6 +89,11 @@ def parser():
         command.add_argument("--limit", type=count_limit, default=30)
         if name == "outbox":
             command.add_argument("--after", type=natural, help="获取此回执 ID 之后的记录")
+    github_run = commands.add_parser("github-run", help="立即处理配置仓库中的一个 issue")
+    github_run.add_argument("--apply", action="store_true", help="实际创建 Draft PR，默认仅生成预览")
+    github_schedule = commands.add_parser("github-schedule", help="定期处理 issue 并创建 Draft PR")
+    github_schedule.add_argument("--in", dest="delay", type=duration, default=60, help="首次触发前的延时")
+    github_schedule.add_argument("--every", type=duration, default=259200, help="重复间隔，默认 3d")
     approvals = commands.add_parser("approvals", help="查看待审批的实际参数")
     approvals.add_argument("--all", action="store_true", help="包含已处理的审批")
     approvals.add_argument("--limit", type=count_limit, default=30)
@@ -161,6 +166,15 @@ def execute(db, args):
     if command == "worker":
         worker.serve(db)
         return None
+    if command == "github-run":
+        return {"event_id": store.enqueue(db, "github", "github", "apply" if args.apply else "preview", timestamp)}
+    if command == "github-schedule":
+        if args.every < 3600:
+            raise ValueError("GitHub 任务的重复间隔至少 1 小时")
+        due = timestamp + args.delay
+        with store.transaction(db):
+            timer_id = store.add_timer(db, "github", "apply", due, args.every, kind="github")
+        return present({"timer_id": timer_id, "due_at": due, "interval_seconds": args.every})
     if command in ("ask", "schedule"):
         body = read_text(args.text, store.MAX_TEXT, "任务")
         session = worker.key_value(args.session)
