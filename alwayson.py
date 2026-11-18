@@ -65,7 +65,7 @@ def ask_args(command):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="单机常驻 Claude 助手，输出为 JSON。")
+    root = argparse.ArgumentParser(description="SoloPatch 常驻 Claude 助手，输出为 JSON。")
     commands = root.add_subparsers(dest="command", required=True)
     ask = commands.add_parser("ask", help="提交一条任务")
     ask_args(ask)

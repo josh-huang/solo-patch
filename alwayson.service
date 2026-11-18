@@ -1,5 +1,5 @@
 [Unit]
-Description=Always-on Claude agent
+Description=SoloPatch always-on Claude agent
 Wants=network-online.target postgresql.service
 After=network-online.target postgresql.service
 StartLimitIntervalSec=0

@@ -1,23 +1,23 @@
-# Always-on Claude Agent
+# SoloPatch
 
-部署在腾讯云轻量应用服务器上的单用户助手。通过 SSH 提交任务、设定计划、审批跟进和查看结果。systemd 负责开机启动与异常重启，PostgreSQL 持久化任务与 checkpoint。队列空闲时，worker 每两秒检查一次数据库，Claude API 用量保持为零。
+SoloPatch 是一个可部署在腾讯云轻量应用服务器上的 Claude Agent。它可以定期巡检你独自维护的 GitHub 仓库，为小 issue 生成 Draft PR。你也可以通过 SSH 提交任务、设定计划、审批跟进和查看结果。systemd 负责开机启动与异常重启，PostgreSQL 持久化任务与 checkpoint。队列空闲时，worker 每两秒检查一次数据库，Claude API 用量保持为零。
 
 ## 在腾讯云安装
 
 安装包面向采用 systemd 的 Ubuntu 和 Debian，建议使用 Ubuntu 22.04、24.04 或 Debian 12。默认在同一台机器安装 PostgreSQL，并通过 Unix socket 和 peer 认证连接。SSH 是操作入口，数据库沿用发行版默认的本地监听设置。实例需要能访问 `api.anthropic.com:443`，并符合 Anthropic 的地区政策。 [腾讯云 Linux 实例登录指引](https://cloud.tencent.com/document/product/1207/47147/) · [Anthropic 支持地区](https://www.anthropic.com/legal/supported-regions)
 
-先把 `always-on-agent.tar.gz` 下载到本机。在终端进入下载目录，把 `SERVER_IP` 换成实例公网 IP，把 `ubuntu` 换成镜像对应的 SSH 用户。
+先把 `solo-patch.tar.gz` 下载到本机。在终端进入下载目录，把 `SERVER_IP` 换成实例公网 IP，把 `ubuntu` 换成镜像对应的 SSH 用户。
 
 ```bash
-scp always-on-agent.tar.gz ubuntu@SERVER_IP:~/
+scp solo-patch.tar.gz ubuntu@SERVER_IP:~/
 ssh ubuntu@SERVER_IP
 ```
 
 登录服务器后安装。
 
 ```bash
-tar -xzf always-on-agent.tar.gz
-cd always-on-agent
+tar -xzf solo-patch.tar.gz
+cd solo-patch
 sudo bash install.sh
 sudoedit /etc/alwayson/anthropic_api_key
 sudo systemctl enable --now alwayson

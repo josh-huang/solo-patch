@@ -80,7 +80,7 @@ class GitHub:
         try:
             conn.request(method, endpoint, body=store.dumps(data).encode("utf-8") if data is not None else None, headers={
                 "Accept": "application/vnd.github+json", "Authorization": "Bearer " + self.token,
-                "X-GitHub-Api-Version": API_VERSION, "User-Agent": "alwayson-personal-agent",
+                "X-GitHub-Api-Version": API_VERSION, "User-Agent": "SoloPatch",
                 "Content-Type": "application/json",
             })
             response = conn.getresponse()
