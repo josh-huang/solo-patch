@@ -1,0 +1,25 @@
+[Unit]
+Description=Always-on Claude agent
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=alwayson
+Group=alwayson
+EnvironmentFile=/etc/alwayson/alwayson.conf
+LoadCredential=anthropic_api_key:/etc/alwayson/anthropic_api_key
+ExecStart=/usr/bin/python3 -E -s -B /opt/alwayson/alwayson.py worker
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

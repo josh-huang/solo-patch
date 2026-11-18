@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+if [ "$(id -u)" -ne 0 ]; then
+    echo '请用 sudo alwayson 运行此命令。' >&2
+    exit 1
+fi
+exec /usr/sbin/runuser -u alwayson -- /usr/bin/env \
+    -u ALWAYSON_DATABASE_URL -u ANTHROPIC_API_KEY -u CREDENTIALS_DIRECTORY \
+    /usr/bin/python3 -E -s -B /opt/alwayson/alwayson.py "$@"
