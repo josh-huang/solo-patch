@@ -100,6 +100,27 @@ CREATE TABLE IF NOT EXISTS usage (
     input_tokens BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id BIGINT NOT NULL REFERENCES events(id),
+    model TEXT NOT NULL,
+    stop_reason TEXT,
+    input_tokens BIGINT NOT NULL,
+    output_tokens BIGINT NOT NULL,
+    cache_creation_input_tokens BIGINT NOT NULL,
+    cache_read_input_tokens BIGINT NOT NULL,
+    request_id TEXT,
+    latency_ms INTEGER NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS llm_calls_event ON llm_calls(event_id);
+CREATE TABLE IF NOT EXISTS github_calls (
+    event_id BIGINT NOT NULL REFERENCES events(id),
+    endpoint TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (event_id, endpoint, status)
+);
 """
 
 
@@ -294,15 +315,37 @@ def reserve_request(db, day, limit):
         return bool(cursor.rowcount)
 
 
-def add_usage(db, day, usage):
-    def tokens(key):
-        value = usage.get(key, 0)
-        return value if type(value) is int and 0 <= value <= 10_000_000 else 0
+def usage_tokens(usage, key):
+    value = usage.get(key, 0) if isinstance(usage, dict) else 0
+    return value if type(value) is int and 0 <= value <= 10_000_000 else 0
 
+
+def add_usage(db, day, usage):
     db.execute(
         "UPDATE usage SET input_tokens = input_tokens + %s, output_tokens = output_tokens + %s WHERE day = %s",
-        (tokens("input_tokens"), tokens("output_tokens"), day),
+        (usage_tokens(usage, "input_tokens"), usage_tokens(usage, "output_tokens"), day),
     )
+
+
+def add_llm_call(db, event_id, model, result, latency_ms, timestamp):
+    usage = result.get("usage")
+    db.execute(
+        """INSERT INTO llm_calls(event_id, model, stop_reason, input_tokens, output_tokens,
+               cache_creation_input_tokens, cache_read_input_tokens, request_id, latency_ms, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (event_id, model, str(result.get("stop_reason"))[:40], usage_tokens(usage, "input_tokens"),
+         usage_tokens(usage, "output_tokens"), usage_tokens(usage, "cache_creation_input_tokens"),
+         usage_tokens(usage, "cache_read_input_tokens"), result.get("_request_id"), latency_ms, timestamp),
+    )
+
+
+def add_github_calls(db, event_id, calls):
+    for (endpoint, status), count in calls.items():
+        db.execute(
+            """INSERT INTO github_calls(event_id, endpoint, status, count) VALUES (%s, %s, %s, %s)
+               ON CONFLICT(event_id, endpoint, status) DO UPDATE SET count = github_calls.count + excluded.count""",
+            (event_id, endpoint, status, count),
+        )
 
 
 def load_checkpoint(db, event_id):

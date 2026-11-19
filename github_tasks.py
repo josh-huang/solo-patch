@@ -21,6 +21,7 @@ MAX_FILES_READ = 12
 MAX_HISTORY_PAGES = 30
 REPOSITORY = re.compile(r"[a-zA-Z0-9-]{1,39}/[a-zA-Z0-9_.-]{1,100}")
 SHA = re.compile(r"[a-f0-9]{40}")
+ENDPOINT_ID = re.compile(r"/(?:[a-f0-9]{40}|[0-9]+)(?=/|$)")
 SEGMENT = re.compile(r"[a-zA-Z0-9_][a-zA-Z0-9_. -]*")
 COAUTHOR = re.compile(r"^\s*co-authored-by\s*:", re.IGNORECASE | re.MULTILINE)
 OUT_OF_SCOPE = re.compile(
@@ -70,8 +71,23 @@ class GitHub:
     def __init__(self, repo, token):
         self.repo = repo
         self.token = token
+        self.calls = {}
 
     def request(self, method, path, params=None, data=None):
+        status = 0
+        try:
+            result = self.send(method, path, params, data)
+            status = 200
+            return result
+        except GitHubError as exc:
+            status = exc.status
+            raise
+        finally:
+            endpoint = "/git/ref/heads/:branch" if path.startswith("/git/ref/heads/") else ENDPOINT_ID.sub("/:id", path)
+            key = (f"{method} {endpoint or '/'}", status)
+            self.calls[key] = self.calls.get(key, 0) + 1
+
+    def send(self, method, path, params=None, data=None):
         endpoint = f"/repos/{self.repo}{path}" if path != "/user" else "/user"
         if params:
             endpoint += "?" + urlencode(params)
@@ -360,13 +376,13 @@ def handle_tool(gh, files, state, name, inputs):
     raise ValueError("工具参数或名称无效。")
 
 
-def model_step(db, gh, state, files, config, call):
+def model_step(db, gh, state, files, config, call, event_id):
     if state["rounds"] >= state["max_rounds"]:
         raise worker.ApiError("Claude 已达到轮数上限，尚未生成可审查的小补丁。")
     answer = worker.metered_call(db, config, call, state["api_version"], {
         "model": state["model"], "max_tokens": state["max_tokens"], "system": SYSTEM,
         "messages": state["messages"], "tools": TOOLS, "tool_choice": {"type": "any"},
-    })
+    }, event_id)
     blocks = answer["content"]
     if answer.get("stop_reason") == "refusal":
         state["result"] = {"skip": "Claude 未能处理该 issue。"}
@@ -484,6 +500,13 @@ def preview(state):
 def run_event(db, event, config, call, stopping=lambda: False):
     settings = config_values()
     gh = GitHub(settings["repo"], get_github_token())
+    try:
+        return run_github(db, gh, settings, event, config, call, stopping)
+    finally:
+        store.add_github_calls(db, event["id"], gh.calls)
+
+
+def run_github(db, gh, settings, event, config, call, stopping):
     state = store.load_checkpoint(db, event["id"])
     is_preview = event["body"] == "preview"
     checked_heads = set()
@@ -543,7 +566,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
         while state["result"] is None:
             if stopping():
                 return False
-            model_step(db, gh, state, files, config, call)
+            model_step(db, gh, state, files, config, call, event["id"])
             save()
     if "skip" in state["result"]:
         record = (gh.repo, number, state["fingerprint"], "skipped", None)

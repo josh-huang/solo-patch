@@ -127,6 +127,7 @@ def call_claude(api_key, version, request):
                 header = (response.getheader("retry-after") or "").strip()
                 delay = min(int(header), 3600) if header.isdecimal() and len(header) <= 7 else 0
             raise ApiError(f"Anthropic API HTTP {response.status}。{hint}", delay)
+        request_id = response.getheader("request-id")
         raw = response.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, http.client.HTTPException) as exc:
         raise ApiError(f"连接 Anthropic API 失败（{type(exc).__name__}）。", 0) from exc
@@ -138,6 +139,7 @@ def call_claude(api_key, version, request):
         result = json.loads(raw)
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             store.dumps(result).encode("utf-8")
+            result["_request_id"] = request_id
             return result
     except (ValueError, RecursionError):
         pass
@@ -250,13 +252,22 @@ def consume(db, state, event, result, last_round):
     raise ApiError("Claude 返回了当前运行器无法处理的结束状态。")
 
 
-def metered_call(db, config, call, version, request):
+def metered_call(db, config, call, version, request, event_id):
     day = store.utc_day(store.now())
     if not store.reserve_request(db, day, config["daily_requests"]):
         raise QuotaExhausted
+    started = time.monotonic()
     result = call(version, request)
-    if isinstance(result.get("usage"), dict):
-        store.add_usage(db, day, result["usage"])
+    latency_ms = int((time.monotonic() - started) * 1000)
+    store.add_usage(db, day, result.get("usage"))
+    store.add_llm_call(db, event_id, request["model"], result, latency_ms, store.now())
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    LOG.info(
+        "llm event=%s stop=%s in=%s out=%s cache_read=%s cache_write=%s ms=%s request_id=%s",
+        event_id, result.get("stop_reason"), usage.get("input_tokens"), usage.get("output_tokens"),
+        usage.get("cache_read_input_tokens"), usage.get("cache_creation_input_tokens"), latency_ms,
+        result.get("_request_id"),
+    )
     return result
 
 
@@ -277,7 +288,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
         }
         if last_round:
             request["tool_choice"] = {"type": "none"}
-        result = metered_call(db, config, call, state["api_version"], request)
+        result = metered_call(db, config, call, state["api_version"], request, event["id"])
         consume(db, state, event, result, last_round)
         state["rounds"] += 1
         store.save_checkpoint(db, event["id"], state, store.now())

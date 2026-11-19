@@ -229,7 +229,17 @@ def execute(db, args):
         ).fetchone()
         if row is None:
             raise ValueError("找不到该任务")
-        return present(row)
+        result = present(row)
+        result["llm_calls"] = [present(r) for r in db.execute(
+            """SELECT model, stop_reason, input_tokens, output_tokens, cache_creation_input_tokens,
+                      cache_read_input_tokens, request_id, latency_ms, created_at
+               FROM llm_calls WHERE event_id = %s ORDER BY id""", (args.id,),
+        ).fetchall()]
+        result["github_calls"] = [dict(r) for r in db.execute(
+            "SELECT endpoint, status, count FROM github_calls WHERE event_id = %s ORDER BY endpoint, status",
+            (args.id,),
+        ).fetchall()]
+        return result
     if command == "timers":
         rows = db.execute("SELECT * FROM timers ORDER BY (status = 'active') DESC, due_at DESC LIMIT 200").fetchall()
         return [present(row) for row in rows]

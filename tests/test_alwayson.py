@@ -235,10 +235,10 @@ class GitHubBase(Base):
     def setUp(self):
         super().setUp()
         self.gh = FakeGitHub()
-        original = github_tasks.GitHub.request
-        github_tasks.GitHub.request = lambda gh, method, path, params=None, data=None: self.gh.handle(
+        original = github_tasks.GitHub.send
+        github_tasks.GitHub.send = lambda gh, method, path, params=None, data=None: self.gh.handle(
             gh, method, path, params, data)
-        self.addCleanup(setattr, github_tasks.GitHub, "request", original)
+        self.addCleanup(setattr, github_tasks.GitHub, "send", original)
         env = {"ALWAYSON_GITHUB_REPO": "me/repo", "ALWAYSON_GITHUB_TOKEN": "github_pat_test",
                "ALWAYSON_GITHUB_PATHS": "README.md,docs/"}
         for key, value in env.items():
@@ -278,6 +278,20 @@ class GitHubFlowTest(GitHubBase):
         self.assertTrue(self.gh.pulls[0]["draft"])
         row = self.db.execute("SELECT * FROM github_issues").fetchone()
         self.assertEqual((row["issue"], row["status"]), (1, "published"))
+
+    def test_usage_ledger_counts_every_call(self):
+        claude = Claude(patch_responses())
+        event_id = self.enqueue()
+        self.serve_once(claude)
+        llm = self.db.execute("SELECT * FROM llm_calls WHERE event_id = %s", (event_id,)).fetchall()
+        self.assertEqual(len(llm), len(claude.requests))
+        self.assertEqual(llm[0]["input_tokens"], 100)
+        counted = self.db.execute(
+            "SELECT SUM(count) AS n FROM github_calls WHERE event_id = %s", (event_id,)).fetchone()["n"]
+        self.assertEqual(counted, len(self.gh.calls))
+        endpoints = {r["endpoint"] for r in self.db.execute("SELECT endpoint FROM github_calls").fetchall()}
+        self.assertIn("GET /git/blobs/:id", endpoints)
+        self.assertIn("GET /git/ref/heads/:branch", endpoints)
 
     def test_kill_after_each_write_still_yields_one_pr(self):
         for point in [("POST", "/git/trees"), ("POST", "/git/commits"), ("POST", "/git/refs"), ("POST", "/pulls")]:
