@@ -28,7 +28,7 @@ SERVER = None
 UID = 1
 CONFIG = {
     "model": "claude-sonnet-5-5", "api_version": "2026-10-21", "max_tokens": 1536,
-    "max_rounds": 4, "daily_requests": 1000,
+    "max_rounds": 4, "daily_requests": 1000, "github_max_tokens": 16000, "github_effort": "medium",
 }
 
 
@@ -269,6 +269,21 @@ class GitHubFlowTest(GitHubBase):
         self.serve_once(claude)
         for request in claude.requests:
             self.assertNotIn("tool_choice", request)
+            self.assertEqual(request["max_tokens"], 16000)
+            self.assertEqual(request["output_config"], {"effort": "medium"})
+
+    def test_old_checkpoint_without_effort_still_resumes(self):
+        claude = Claude([patch_responses()[0], Crash()])
+        event_id = self.enqueue("preview")
+        with self.assertRaises(Crash):
+            self.serve_once(claude)
+        state = store.load_checkpoint(self.db, event_id)
+        del state["effort"]
+        store.save_checkpoint(self.db, event_id, state, store.now())
+        store.recover(self.db, store.now())
+        claude = Claude(patch_responses()[1:])
+        self.assertEqual(self.serve_once(claude)["status"], "done")
+        self.assertNotIn("output_config", claude.requests[0])
 
     def test_text_answer_gets_one_reminder_then_continues(self):
         text = [{"type": "thinking", "thinking": "", "signature": "c2ln"}, {"type": "text", "text": "I think..."}]

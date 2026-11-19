@@ -106,7 +106,9 @@ def get_api_key():
 
 def call_claude(api_key, version, request):
     # Use one fixed TLS endpoint. HTTP redirects and environment proxies are never followed.
-    connection = http.client.HTTPSConnection("api.anthropic.com", timeout=90)
+    # Non-streaming: the read blocks for the whole generation, so allow time in proportion to max_tokens.
+    timeout = max(90, request["max_tokens"] // 40)
+    connection = http.client.HTTPSConnection("api.anthropic.com", timeout=timeout)
     try:
         connection.request("POST", "/v1/messages", body=store.dumps(request).encode("utf-8"), headers={
             "anthropic-version": version, "content-type": "application/json",
@@ -302,10 +304,15 @@ def serve(db):
     config = {
         "model": key_value(os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)),
         "api_version": os.environ.get("ANTHROPIC_API_VERSION", API_VERSION),
-        "max_tokens": env_number("ALWAYSON_MAX_TOKENS", 1536, 256, 8192),
+        "max_tokens": env_number("ALWAYSON_MAX_TOKENS", 4096, 256, 32000),
         "max_rounds": env_number("ALWAYSON_MAX_ROUNDS", 6, 2, 12),
         "daily_requests": env_number("ALWAYSON_DAILY_REQUESTS", 100, 1, 10000),
+        # Thinking tokens count toward max_tokens, and a patch carries old and new text.
+        "github_max_tokens": env_number("ALWAYSON_GITHUB_MAX_TOKENS", 16000, 1024, 32000),
+        "github_effort": os.environ.get("ALWAYSON_GITHUB_EFFORT", "medium").strip(),
     }
+    if config["github_effort"] not in ("", "low", "medium", "high", "xhigh", "max"):
+        raise ValueError("ALWAYSON_GITHUB_EFFORT 应为 low、medium、high、xhigh、max 或留空")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", config["api_version"]):
         raise ValueError("ANTHROPIC_API_VERSION 需要 YYYY-MM-DD")
     api_key = get_api_key()

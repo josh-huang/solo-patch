@@ -127,7 +127,7 @@ sudoedit /etc/alwayson/alwayson.conf
 sudo systemctl restart alwayson
 ```
 
-默认模型为 `claude-sonnet-5-5`。可在配置中修改模型和 API 版本。单个任务默认最多调用 Claude 6 轮，每轮最多输出 1,536 tokens。每日最多尝试 100 次 API 请求，按 UTC 日计算，到上限后排队等到下一个 UTC 日。此设置限制请求次数，API 费用以 Anthropic 账单为准。网络错误和限流会退避重试，持续失败会写入发件箱。 [Claude 模型列表](https://platform.claude.com/docs/en/models/overview) · [Messages API](https://platform.claude.com/docs/en/api/messages/create)
+默认模型为 `claude-sonnet-5-5`。可在配置中修改模型和 API 版本。单个任务默认最多调用 Claude 6 轮。对话任务每轮最多输出 4,096 tokens（`ALWAYSON_MAX_TOKENS`）。GitHub 任务每轮最多输出 16,000 tokens（`ALWAYSON_GITHUB_MAX_TOKENS`），effort 默认为 `medium`（`ALWAYSON_GITHUB_EFFORT`，可选 low、medium、high、xhigh、max；留空则使用模型默认值）。思考也计入输出上限，上限太小会导致任务以 `max_tokens` 失败。安装脚本不会覆盖已有的 `/etc/alwayson/alwayson.conf`，升级时请手动把原来的 `ALWAYSON_MAX_TOKENS=1536` 调高。每日最多尝试 100 次 API 请求，按 UTC 日计算，到上限后排队等到下一个 UTC 日。此设置限制请求次数，API 费用以 Anthropic 账单为准。网络错误和限流会退避重试，持续失败会写入发件箱。 [Claude 模型列表](https://platform.claude.com/docs/en/models/overview) · [Messages API](https://platform.claude.com/docs/en/api/messages/create)
 
 用 `sudo alwayson retry EVENT_ID` 让失败任务从 checkpoint 继续。改了模型、轮数或输出上限后，如需用新配置从第一轮重跑，请加 `--fresh`。用 `sudo alwayson cancel EVENT_ID` 取消排队中或失败的任务。
 

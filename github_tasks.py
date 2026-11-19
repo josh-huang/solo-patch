@@ -384,10 +384,13 @@ def model_step(db, gh, state, files, config, call, event_id):
         raise worker.ApiError("Claude 已达到轮数上限，尚未生成可审查的小补丁。")
     last_round = state["rounds"] + 1 >= state["max_rounds"]
     # Forced tool_choice (any/tool) returns HTTP 400 on Sonnet 5.5 and newer models, so steer with auto + reminders.
-    answer = worker.metered_call(db, config, call, state["api_version"], {
+    request = {
         "model": state["model"], "max_tokens": state["max_tokens"], "system": SYSTEM,
         "messages": state["messages"], "tools": TOOLS,
-    }, event_id)
+    }
+    if state.get("effort"):
+        request["output_config"] = {"effort": state["effort"]}
+    answer = worker.metered_call(db, config, call, state["api_version"], request, event_id)
     blocks = answer["content"]
     if answer.get("stop_reason") == "refusal":
         state["result"] = {"skip": "Claude 未能处理该 issue。"}
@@ -562,7 +565,8 @@ def run_github(db, gh, settings, event, config, call, stopping):
             "version": 1, "settings": settings, "default": default, "base": base, "tree": tree,
             "issue": issue["number"], "fingerprint": mark, "rounds": 0, "files": {}, "result": None,
             "model": config["model"], "api_version": config["api_version"],
-            "max_tokens": config["max_tokens"], "max_rounds": config["max_rounds"],
+            "max_tokens": config["github_max_tokens"], "max_rounds": config["max_rounds"],
+            "effort": config["github_effort"],
             "messages": [{"role": "user", "content": store.dumps({
                 "repository": gh.repo, "number": issue["number"], "title": (issue.get("title") or "")[:300],
                 "body": (issue.get("body") or "")[:8000], "paths": settings["paths"],
