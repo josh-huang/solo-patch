@@ -267,7 +267,35 @@ class GitHubFlowTest(GitHubBase):
         claude = Claude(patch_responses())
         self.enqueue("preview")
         self.serve_once(claude)
-        self.assertEqual(claude.requests[0]["tool_choice"], {"type": "any"})
+        for request in claude.requests:
+            self.assertNotIn("tool_choice", request)
+
+    def test_text_answer_gets_one_reminder_then_continues(self):
+        text = [{"type": "thinking", "thinking": "", "signature": "c2ln"}, {"type": "text", "text": "I think..."}]
+        claude = Claude([reply(text, "end_turn")] + patch_responses())
+        self.enqueue("preview")
+        self.assertEqual(self.serve_once(claude)["status"], "done")
+        second = claude.requests[1]["messages"]
+        self.assertEqual(second[1], {"role": "assistant", "content": text})
+        self.assertEqual(second[2]["content"][0]["text"], github_tasks.FINISH_REMINDER)
+        self.assertIn("+Hello world", self.outbox()[0])
+
+    def test_last_round_reminder_and_round_limit_skip(self):
+        self.gh.issues[2] = FakeGitHub.issue(2)
+        loop = [reply([tool_use("list_files", {"query": ""}, f"x{i}")]) for i in range(CONFIG["max_rounds"])]
+        claude = Claude(loop)
+        self.enqueue()
+        event = self.serve_once(claude)
+        self.assertEqual(event["status"], "done")
+        last_user = claude.requests[-1]["messages"][-1]["content"]
+        self.assertEqual(last_user[-1], {"type": "text", "text": github_tasks.LAST_ROUND_REMINDER})
+        self.assertEqual([b["type"] for b in last_user[:-1]], ["tool_result"])
+        row = self.db.execute("SELECT * FROM github_issues WHERE issue = 1").fetchone()
+        self.assertEqual(row["status"], "skipped")
+        claude = Claude(patch_responses())
+        self.enqueue("preview")
+        self.serve_once(claude)
+        self.assertEqual(self.first_issue_number(claude), 2)
 
     def test_apply_publishes_one_draft_pr(self):
         claude = Claude(patch_responses())
@@ -317,7 +345,7 @@ class GitHubFlowTest(GitHubBase):
         self.gh.issues[2] = FakeGitHub.issue(2)
         picked = []
         for _ in range(3):
-            claude = Claude([reply([tool_use("list_files", {"query": ""}, f"x{i}")]) for i in range(CONFIG["max_rounds"])])
+            claude = Claude([reply([], "max_tokens")])
             self.enqueue("preview")
             event = self.serve_once(claude)
             self.assertEqual(event["status"], "failed")

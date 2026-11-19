@@ -42,6 +42,9 @@ old 必须逐字匹配且在当前文件中只出现一次；保留换行和缩�
 必须通过 submit_patch 或 skip_issue 给出结果。不要声称已执行测试、提交代码或开 PR。
 """
 
+FINISH_REMINDER = "请调用 submit_patch 或 skip_issue 结束本次任务，不要只用文字回答。"
+LAST_ROUND_REMINDER = "下一轮是最后一轮：必须调用 submit_patch 或 skip_issue，不要再读取文件。"
+
 STRING = {"type": "string"}
 TOOLS = [
     worker.tool("list_files", "搜索允许读取的现有文件路径。query 可以为空。", {"query": STRING}),
@@ -379,9 +382,11 @@ def handle_tool(gh, files, state, name, inputs):
 def model_step(db, gh, state, files, config, call, event_id):
     if state["rounds"] >= state["max_rounds"]:
         raise worker.ApiError("Claude 已达到轮数上限，尚未生成可审查的小补丁。")
+    last_round = state["rounds"] + 1 >= state["max_rounds"]
+    # Forced tool_choice (any/tool) returns HTTP 400 on Sonnet 5.5 and newer models, so steer with auto + reminders.
     answer = worker.metered_call(db, config, call, state["api_version"], {
         "model": state["model"], "max_tokens": state["max_tokens"], "system": SYSTEM,
-        "messages": state["messages"], "tools": TOOLS, "tool_choice": {"type": "any"},
+        "messages": state["messages"], "tools": TOOLS,
     }, event_id)
     blocks = answer["content"]
     if answer.get("stop_reason") == "refusal":
@@ -389,6 +394,17 @@ def model_step(db, gh, state, files, config, call, event_id):
         return
     if any(not isinstance(block, dict) for block in blocks):
         raise worker.ApiError("Claude 返回了无效的内容块。", 0)
+    if answer.get("stop_reason") == "end_turn":
+        state["rounds"] += 1
+        if last_round:
+            text = " ".join(b["text"] for b in blocks if b.get("type") == "text" and isinstance(b.get("text"), str))
+            state["result"] = {"skip": ("Claude 未调用 submit_patch 或 skip_issue。" + text.strip())[:600]}
+            return
+        state["messages"].extend([
+            {"role": "assistant", "content": blocks},
+            {"role": "user", "content": [{"type": "text", "text": FINISH_REMINDER}]},
+        ])
+        return
     if answer.get("stop_reason") != "tool_use":
         raise worker.ApiError("Claude 未返回完整的 GitHub 工具调用。")
     calls = [block for block in blocks if block.get("type") == "tool_use"]
@@ -404,6 +420,11 @@ def model_step(db, gh, state, files, config, call, event_id):
             result.update(content=str(exc), is_error=True)
         results.append(result)
     state["rounds"] += 1
+    if state["result"] is None and last_round:
+        state["result"] = {"skip": "Claude 未在轮数上限内给出可审查的补丁。"}
+    elif state["result"] is None and state["rounds"] + 1 >= state["max_rounds"]:
+        # Text must follow the tool_result blocks inside the same user message.
+        results.append({"type": "text", "text": LAST_ROUND_REMINDER})
     state["messages"].extend([{"role": "assistant", "content": blocks}, {"role": "user", "content": results}])
 
 
