@@ -4,6 +4,7 @@ import http.client
 import json
 import logging
 import os
+import random
 import re
 import signal
 import time
@@ -354,7 +355,9 @@ def process_event(db, event, config, call, stopping):
         store.postpone_for_quota(db, event, store.now())
         LOG.info("event=%s paused for UTC daily quota", event["id"])
     except ApiError as exc:
-        delay = None if exc.retry_after is None else max(exc.retry_after, 15 * 2 ** (event["attempts"] - 1))
+        # Transient errors only (retry_after is set): 30s, 2m, 8m, 32m, 1h with jitter, so a short outage is ridden out.
+        backoff = min(3600, 30 * 4 ** (event["attempts"] - 1)) * random.uniform(1.0, 1.2)
+        delay = None if exc.retry_after is None else max(exc.retry_after, int(backoff))
         with store.transaction(db):
             store.record_failure(db, event, str(exc), store.now(), delay)
         LOG.warning("event=%s attempt=%s %s", event["id"], event["attempts"], exc)

@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
 DEFAULT_DSN = "dbname=alwayson user=alwayson host=/var/run/postgresql"
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 6
 MAX_TEXT = 8000
 MAX_INTERVAL = 365 * 86400
 MAX_TIMERS = 64

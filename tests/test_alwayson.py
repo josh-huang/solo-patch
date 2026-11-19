@@ -121,7 +121,8 @@ class FakeGitHub:
         gh.token_expires = self.token_expires
         for (fail_method, prefix), status in self.fail.items():
             if method == fail_method and path.startswith(prefix):
-                raise github_tasks.GitHubError(status)
+                # Mirror GitHub.send: server errors are retryable, client errors are not.
+                raise github_tasks.GitHubError(status, 0 if status >= 500 else None)
         result = self.override[(method, path)] if (method, path) in self.override else self.route(
             method, path, params or {}, data)
         if self.crash_after and self.crash_after == (method, path):
@@ -382,6 +383,22 @@ class GitHubFlowTest(GitHubBase):
             event = self.serve_once(Claude(patch_responses()))
         self.assertEqual(event["status"], "failed")
         self.assertIn("内部错误", self.outbox("error")[0])
+
+    def test_transient_errors_back_off_then_fail(self):
+        self.gh.fail[("GET", "/user")] = 502
+        event_id = self.enqueue()
+        delays = []
+        while True:
+            before = store.now()
+            event = self.serve_once(Claude([]))
+            if event["status"] == "failed":
+                break
+            delays.append(event["available_at"] - before)
+            self.db.execute("UPDATE events SET available_at = 0 WHERE id = %s", (event_id,))
+        self.assertEqual(event["attempts"], store.MAX_ATTEMPTS)
+        self.assertEqual(len(delays), store.MAX_ATTEMPTS - 1)
+        for got, base in zip(delays, [30, 120, 480, 1920, 3600]):
+            self.assertTrue(base <= got <= base * 1.2 + 1, (got, base))
 
     def test_max_tokens_fails_the_event(self):
         claude = Claude([reply([], "max_tokens")])
