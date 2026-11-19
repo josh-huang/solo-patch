@@ -3,6 +3,7 @@ Description=SoloPatch always-on Claude agent
 Wants=network-online.target postgresql.service
 After=network-online.target postgresql.service
 StartLimitIntervalSec=0
+OnFailure=alwayson-alert.service
 
 [Service]
 Type=simple
@@ -15,6 +16,8 @@ LoadCredential=github_token:/etc/alwayson/github_token
 ExecStart=/usr/bin/python3 -E -s -B /opt/alwayson/alwayson.py worker
 Restart=on-failure
 RestartSec=10s
+# Exit 3 = configuration error (missing key, bad setting): stop and alert instead of restarting forever.
+RestartPreventExitStatus=3
 TimeoutStopSec=90s
 NoNewPrivileges=true
 PrivateTmp=true

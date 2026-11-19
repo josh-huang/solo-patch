@@ -9,6 +9,7 @@ import re
 import signal
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg2
 
@@ -318,6 +319,7 @@ def serve(db):
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", config["api_version"]):
         raise ValueError("ANTHROPIC_API_VERSION 需要 YYYY-MM-DD")
     api_key = get_api_key()
+    notify_url = notify_url_value()
     if not db.execute("SELECT pg_try_advisory_lock(349811, 1) AS held").fetchone()["held"]:
         raise ValueError("此数据库已有常驻 worker")
     stopping = False
@@ -329,8 +331,13 @@ def serve(db):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     store.recover(db, store.now())
-    LOG.info("worker started model=%s daily_requests=%s", config["model"], config["daily_requests"])
+    LOG.info("worker started model=%s daily_requests=%s notify=%s",
+             config["model"], config["daily_requests"], bool(notify_url))
+    next_notify = 0.0
     while not stopping:
+        if notify_url and time.monotonic() >= next_notify:
+            dispatch_notifications(db, notify_url, send_notification)
+            next_notify = time.monotonic() + 30
         store.tick(db, store.now())
         event = store.claim(db, store.now())
         if event is None:
@@ -341,6 +348,50 @@ def serve(db):
             lambda: stopping,
         )
     LOG.info("worker stopped")
+
+
+def notify_url_value():
+    url = os.environ.get("ALWAYSON_NOTIFY_URL", "").strip()
+    if url and (urlsplit(url).scheme != "https" or not urlsplit(url).hostname):
+        raise ValueError("ALWAYSON_NOTIFY_URL 需要 https:// 开头的完整地址，或留空关闭通知")
+    return url
+
+
+def send_notification(url, text):
+    # Plain-text POST (ntfy-style). Fixed host, no redirects or environment proxies, like call_claude.
+    parts = urlsplit(url)
+    connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=15)
+    try:
+        connection.request("POST", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
+                           body=text.encode("utf-8"),
+                           headers={"content-type": "text/plain; charset=utf-8", "user-agent": "SoloPatch"})
+        status = connection.getresponse().status
+    finally:
+        connection.close()
+    if not 200 <= status < 300:
+        raise OSError(f"通知地址返回 HTTP {status}")
+
+
+def dispatch_notifications(db, url, send):
+    """Push new error, warning and approval outbox rows; the cursor only advances after a successful send."""
+    row = db.execute("SELECT value FROM settings WHERE key = 'notified_outbox_id'").fetchone()
+    if row is None:
+        # First run with notifications on: start from now instead of replaying old history.
+        latest = db.execute("SELECT COALESCE(MAX(id), 0) AS id FROM outbox").fetchone()["id"]
+        db.execute("INSERT INTO settings(key, value) VALUES ('notified_outbox_id', %s)", (str(latest),))
+        return
+    rows = db.execute(
+        """SELECT id, session, kind, body FROM outbox WHERE id > %s
+           AND kind IN ('error', 'warning', 'approval') ORDER BY id LIMIT 20""",
+        (int(row["value"]),),
+    ).fetchall()
+    for item in rows:
+        try:
+            send(url, f"[SoloPatch/{item['session']}] {item['kind']}: {item['body'][:1500]}")
+        except (OSError, http.client.HTTPException) as exc:
+            LOG.warning("notification failed outbox=%s %s", item["id"], exc)
+            return
+        db.execute("UPDATE settings SET value = %s WHERE key = 'notified_outbox_id'", (str(item["id"]),))
 
 
 def process_event(db, event, config, call, stopping):

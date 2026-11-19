@@ -526,6 +526,78 @@ class ChatTest(Base):
         self.assertEqual(claude.requests[0]["messages"][1], {"role": "assistant", "content": first})
 
 
+class AlertTest(Base):
+    def test_dispatch_pushes_new_alert_rows_once(self):
+        event_id = store.enqueue(self.db, "user", "demo", "hi", store.now())
+        event = {"id": event_id, "session": "demo"}
+        store.emit(self.db, event, "error", "old failure", 0)
+        sent = []
+        worker.dispatch_notifications(self.db, "https://ntfy.example/t", lambda url, text: sent.append(text))
+        self.assertEqual(sent, [], "first dispatch only sets the cursor")
+        for kind, body in [("reply", "chatty"), ("error", "boom"), ("warning", "token"), ("approval", "{}")]:
+            store.emit(self.db, event, kind, body, 0)
+        worker.dispatch_notifications(self.db, "https://ntfy.example/t", lambda url, text: sent.append(text))
+        worker.dispatch_notifications(self.db, "https://ntfy.example/t", lambda url, text: sent.append(text))
+        self.assertEqual(sent, ["[SoloPatch/demo] error: boom", "[SoloPatch/demo] warning: token",
+                                "[SoloPatch/demo] approval: {}"])
+
+    def test_failed_send_keeps_the_row_for_next_time(self):
+        event = {"id": store.enqueue(self.db, "user", "demo", "hi", store.now()), "session": "demo"}
+        worker.dispatch_notifications(self.db, "https://x/t", lambda url, text: None)
+        store.emit(self.db, event, "error", "boom", 0)
+
+        def down(url, text):
+            raise OSError("unreachable")
+        with self.assertLogs("alwayson", "WARNING"):
+            worker.dispatch_notifications(self.db, "https://x/t", down)
+        sent = []
+        worker.dispatch_notifications(self.db, "https://x/t", lambda url, text: sent.append(text))
+        self.assertEqual(len(sent), 1)
+
+    def test_send_notification_posts_text(self):
+        seen = {}
+
+        class Connection:
+            def __init__(self, host, port, timeout):
+                seen.update(host=host, port=port)
+            def request(self, method, path, body, headers):
+                seen.update(method=method, path=path, body=body)
+            def getresponse(self):
+                return StubResponse(seen.get("status", 200), {})
+            def close(self): pass
+
+        original = worker.http.client.HTTPSConnection
+        worker.http.client.HTTPSConnection = Connection
+        self.addCleanup(setattr, worker.http.client, "HTTPSConnection", original)
+        worker.send_notification("https://ntfy.example:8443/topic?x=1", "你好")
+        self.assertEqual((seen["host"], seen["port"], seen["method"], seen["path"]),
+                         ("ntfy.example", 8443, "POST", "/topic?x=1"))
+        self.assertEqual(seen["body"], "你好".encode())
+        seen["status"] = 500
+        self.assertRaises(OSError, worker.send_notification, "https://ntfy.example/topic", "x")
+
+    def test_notify_url_must_be_https(self):
+        for value, ok in [("", True), ("https://ntfy.sh/topic", True), ("http://ntfy.sh/t", False), ("ntfy.sh", False)]:
+            os.environ["ALWAYSON_NOTIFY_URL"] = value
+            if ok:
+                worker.notify_url_value()
+            else:
+                self.assertRaises(ValueError, worker.notify_url_value)
+        os.environ.pop("ALWAYSON_NOTIFY_URL")
+
+    def test_worker_config_error_exits_3(self):
+        import alwayson
+        env = {"ALWAYSON_DATABASE_URL": f"dbname=t user=postgres host={HOST}", "ANTHROPIC_API_KEY": ""}
+        for key, value in env.items():
+            self.addCleanup(os.environ.pop, key, None)
+            os.environ[key] = value
+        self.addCleanup(setattr, sys, "argv", sys.argv)
+        sys.argv = ["alwayson", "worker"]
+        self.assertEqual(alwayson.main(), 3)
+        sys.argv = ["alwayson", "notify", "hello"]
+        self.assertEqual(alwayson.main(), 0)
+
+
 class StoreTest(Base):
     def test_init_schema_is_rerunnable(self):
         store.init_schema(self.db)

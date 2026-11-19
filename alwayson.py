@@ -76,6 +76,8 @@ def parser():
     starts.add_argument("--in", dest="delay", type=duration, help="首次执行前的延时，例如 1h")
     starts.add_argument("--at", type=date_time, help="首次执行时间，包含时区")
     schedule.add_argument("--every", type=duration, help="重复间隔，例如 1d，至少 60 秒")
+    notify = commands.add_parser("notify", help="向 ALWAYSON_NOTIFY_URL 发送一条通知（供 systemd 告警使用）")
+    notify.add_argument("text")
     for name, help_text in [
         ("status", "查看队列和今天的 API 用量"), ("timers", "查看定时器"),
         ("memory", "查看已保存记忆"), ("init-db", "初始化数据库表"),
@@ -277,6 +279,12 @@ def execute(db, args):
 def main():
     args = parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.command == "notify":
+        # No database needed: this runs when the service itself is down.
+        url = worker.notify_url_value()
+        if url:
+            worker.send_notification(url, args.text[:1500])
+        return 0
     try:
         with closing(store.connect(os.environ.get("ALWAYSON_DATABASE_URL", store.DEFAULT_DSN))) as conn:
             with conn.cursor() as db:
@@ -286,7 +294,8 @@ def main():
         return 0
     except (ValueError, OSError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
-        return 1
+        # Exit 3 marks a worker configuration error: systemd stops restarting (RestartPreventExitStatus) and alerts.
+        return 3 if args.command == "worker" and isinstance(exc, ValueError) else 1
     except psycopg2.Error as exc:
         detail = exc.diag.message_primary
         message = f"数据库操作失败（SQLSTATE {exc.pgcode or '连接错误'}）。"
