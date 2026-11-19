@@ -102,6 +102,7 @@ class FakeGitHub:
         self.crash_after = None
         self.counter = 0
         self.token_expires = None
+        self.override: dict = {}
 
     @staticmethod
     def issue(number: int, author: int = UID) -> dict:
@@ -121,7 +122,8 @@ class FakeGitHub:
         for (fail_method, prefix), status in self.fail.items():
             if method == fail_method and path.startswith(prefix):
                 raise github_tasks.GitHubError(status)
-        result = self.route(method, path, params or {}, data)
+        result = self.override[(method, path)] if (method, path) in self.override else self.route(
+            method, path, params or {}, data)
         if self.crash_after and self.crash_after == (method, path):
             self.crash_after = None
             raise Crash()
@@ -214,17 +216,8 @@ class Base(unittest.TestCase):
         return event
 
     def serve_once(self, call) -> dict:
-        """Mirror of one iteration of worker.serve's loop body."""
         event = self.claim()
-        try:
-            run = github_tasks.run_event if event["kind"] == "github" else worker.run_event
-            run(self.db, event, CONFIG, call, lambda: False)
-        except worker.QuotaExhausted:
-            store.postpone_for_quota(self.db, event, store.now())
-        except worker.ApiError as exc:
-            delay = None if exc.retry_after is None else max(exc.retry_after, 15 * 2 ** (event["attempts"] - 1))
-            with store.transaction(self.db):
-                store.record_failure(self.db, event, str(exc), store.now(), delay)
+        worker.process_event(self.db, event, CONFIG, call, lambda: False)
         return self.event(event["id"])
 
     def event(self, event_id: int) -> dict:
@@ -381,6 +374,14 @@ class GitHubFlowTest(GitHubBase):
         with store.transaction(self.db):
             store.record_failure(self.db, event, "boom", store.now())
         self.assertEqual(self.db.execute("SELECT status FROM github_issues").fetchone()["status"], "published")
+
+    def test_unexpected_exception_fails_only_that_event(self):
+        self.gh.override[("GET", "/git/blobs/" + sha("blob:README.md"))] = {"encoding": "base64", "sha": sha("blob:README.md")}
+        self.enqueue("preview")
+        with self.assertLogs("alwayson", "ERROR"):
+            event = self.serve_once(Claude(patch_responses()))
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("内部错误", self.outbox("error")[0])
 
     def test_max_tokens_fails_the_event(self):
         claude = Claude([reply([], "max_tokens")])

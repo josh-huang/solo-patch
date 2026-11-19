@@ -9,6 +9,8 @@ import signal
 import time
 from pathlib import Path
 
+import psycopg2
+
 import store
 
 LOG = logging.getLogger("alwayson")
@@ -299,8 +301,6 @@ def run_event(db, event, config, call, stopping=lambda: False):
 
 
 def serve(db):
-    import github_tasks
-
     config = {
         "model": key_value(os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)),
         "api_version": os.environ.get("ANTHROPIC_API_VERSION", API_VERSION),
@@ -334,22 +334,34 @@ def serve(db):
         if event is None:
             time.sleep(2)
             continue
-        try:
-            run = github_tasks.run_event if event["kind"] == "github" else run_event
-            finished = run(
-                db, event, config, lambda version, request: call_claude(api_key, version, request),
-                lambda: stopping,
-            )
-            if not finished:
-                store.release_on_shutdown(db, event, store.now())
-            else:
-                LOG.info("event=%s done", event["id"])
-        except QuotaExhausted:
-            store.postpone_for_quota(db, event, store.now())
-            LOG.info("event=%s paused for UTC daily quota", event["id"])
-        except ApiError as exc:
-            delay = None if exc.retry_after is None else max(exc.retry_after, 15 * 2 ** (event["attempts"] - 1))
-            with store.transaction(db):
-                store.record_failure(db, event, str(exc), store.now(), delay)
-            LOG.warning("event=%s attempt=%s %s", event["id"], event["attempts"], exc)
+        process_event(
+            db, event, config, lambda version, request: call_claude(api_key, version, request),
+            lambda: stopping,
+        )
     LOG.info("worker stopped")
+
+
+def process_event(db, event, config, call, stopping):
+    import github_tasks
+
+    try:
+        run = github_tasks.run_event if event["kind"] == "github" else run_event
+        if not run(db, event, config, call, stopping):
+            store.release_on_shutdown(db, event, store.now())
+        else:
+            LOG.info("event=%s done", event["id"])
+    except QuotaExhausted:
+        store.postpone_for_quota(db, event, store.now())
+        LOG.info("event=%s paused for UTC daily quota", event["id"])
+    except ApiError as exc:
+        delay = None if exc.retry_after is None else max(exc.retry_after, 15 * 2 ** (event["attempts"] - 1))
+        with store.transaction(db):
+            store.record_failure(db, event, str(exc), store.now(), delay)
+        LOG.warning("event=%s attempt=%s %s", event["id"], event["attempts"], exc)
+    except psycopg2.Error:
+        # The connection may be gone; let systemd restart the process and recover() requeue the event.
+        raise
+    except Exception:
+        LOG.exception("event=%s crashed", event["id"])
+        with store.transaction(db):
+            store.record_failure(db, event, "运行时内部错误，详见 journalctl -u alwayson。", store.now())
