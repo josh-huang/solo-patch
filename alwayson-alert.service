@@ -1,0 +1,14 @@
+[Unit]
+Description=Alert that the SoloPatch worker stopped
+
+[Service]
+Type=oneshot
+User=alwayson
+Group=alwayson
+EnvironmentFile=/etc/alwayson/alwayson.conf
+ExecStart=/usr/bin/python3 -E -s -B /opt/alwayson/alwayson.py notify "SoloPatch worker 已停止（配置错误或无法启动），请运行 journalctl -u alwayson -n 50 查看原因。"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

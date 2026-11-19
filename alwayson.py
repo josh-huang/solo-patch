@@ -76,6 +76,8 @@ def parser():
     starts.add_argument("--in", dest="delay", type=duration, help="首次执行前的延时，例如 1h")
     starts.add_argument("--at", type=date_time, help="首次执行时间，包含时区")
     schedule.add_argument("--every", type=duration, help="重复间隔，例如 1d，至少 60 秒")
+    notify = commands.add_parser("notify", help="向 ALWAYSON_NOTIFY_URL 发送一条通知（供 systemd 告警使用）")
+    notify.add_argument("text")
     for name, help_text in [
         ("status", "查看队列和今天的 API 用量"), ("timers", "查看定时器"),
         ("memory", "查看已保存记忆"), ("init-db", "初始化数据库表"),
@@ -229,7 +231,17 @@ def execute(db, args):
         ).fetchone()
         if row is None:
             raise ValueError("找不到该任务")
-        return present(row)
+        result = present(row)
+        result["llm_calls"] = [present(r) for r in db.execute(
+            """SELECT model, stop_reason, input_tokens, output_tokens, cache_creation_input_tokens,
+                      cache_read_input_tokens, request_id, latency_ms, created_at
+               FROM llm_calls WHERE event_id = %s ORDER BY id""", (args.id,),
+        ).fetchall()]
+        result["github_calls"] = [dict(r) for r in db.execute(
+            "SELECT endpoint, status, count FROM github_calls WHERE event_id = %s ORDER BY endpoint, status",
+            (args.id,),
+        ).fetchall()]
+        return result
     if command == "timers":
         rows = db.execute("SELECT * FROM timers ORDER BY (status = 'active') DESC, due_at DESC LIMIT 200").fetchall()
         return [present(row) for row in rows]
@@ -267,6 +279,12 @@ def execute(db, args):
 def main():
     args = parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.command == "notify":
+        # No database needed: this runs when the service itself is down.
+        url = worker.notify_url_value()
+        if url:
+            worker.send_notification(url, args.text[:1500])
+        return 0
     try:
         with closing(store.connect(os.environ.get("ALWAYSON_DATABASE_URL", store.DEFAULT_DSN))) as conn:
             with conn.cursor() as db:

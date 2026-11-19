@@ -71,6 +71,8 @@ sudo alwayson approvals
 
 建好或升级服务后，在 GitHub 创建一个 **fine-grained personal access token**。Resource owner 选择你自己的个人账号，Repository access 只选择目标仓库。Repository permissions 选 `Issues: Read-only`、`Contents: Read and write`、`Pull requests: Read and write`，`Metadata: Read-only` 会默认提供。请确认目标仓库的 GitHub 套餐支持 Draft PR。 [GitHub Token 文档](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) · [Draft PR API](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)
 
+`Contents: Read and write` 也允许直接推送默认分支。程序只会创建 `alwayson/*` 分支，但为了防止 Token 泄漏或程序缺陷造成破坏，建议在仓库 Settings → Rules → Rulesets 里给默认分支加一条规则：禁止直接推送和 force push。确认 bypass 列表里没有你自己，否则这个 Token 仍能绕过规则。
+
 ```bash
 sudoedit /etc/alwayson/github_token
 sudoedit /etc/alwayson/github.conf
@@ -85,7 +87,7 @@ ALWAYSON_GITHUB_LABEL=agent-ready
 ALWAYSON_GITHUB_PATHS=README.md,docs/,src/,tests/
 ```
 
-在目标仓库给愿意让 Agent 处理的开放 issue 加上 `agent-ready` 标签。Agent 会从较早的候选里选择一个尚未分派的 issue。若仓库已经用 `good first issue` 标记类似任务，可以修改配置中的候选标签。
+在目标仓库给愿意让 Agent 处理的开放 issue 加上 `agent-ready` 标签。Agent 会从较早的候选里选择一个尚未分派的 issue，并且只处理由 Token 对应账号本人开的 issue（公开仓库里他人开的 issue 可能在打标签后被改写，内容会进入 prompt）。同一个 issue 在内容不变的情况下连续失败 2 次后会被暂停，编辑 issue 后恢复。若仓库已经用 `good first issue` 标记类似任务，可以修改配置中的候选标签。
 
 ```bash
 sudo alwayson github-run
@@ -119,6 +121,18 @@ sudo alwayson timers
 
 如果进程在 Anthropic 收到请求后、checkpoint 提交前中断，该轮请求可能重发并再次计费。本地已提交的回执和审批不会因此重复写入。 [Anthropic《Building always-on agents》](https://claude.com/resources/articles/building-always-on-agents) · [Claude 工具调用协议](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
 
+## 运行测试
+
+测试使用嵌入式 PostgreSQL（pgserver）、脚本化的 Claude 响应和内存里的假 GitHub，不会访问 Anthropic 或 GitHub。
+
+```bash
+python3 -m uv venv .venv --python 3.12
+python3 -m uv pip install --python .venv/bin/python pgserver psycopg2-binary
+.venv/bin/python -I -m unittest discover -s tests -v
+```
+
+用 `sudo alwayson show EVENT_ID` 可以查看单个任务每次 Claude 调用的 token（包括缓存读写）、stop_reason、request-id、耗时，以及按端点统计的 GitHub 调用次数。
+
 ## 查看日志、限制用量和备份
 
 ```bash
@@ -127,7 +141,9 @@ sudoedit /etc/alwayson/alwayson.conf
 sudo systemctl restart alwayson
 ```
 
-默认模型为 `claude-sonnet-5-5`。可在配置中修改模型和 API 版本。单个任务默认最多调用 Claude 6 轮，每轮最多输出 1,536 tokens。每日最多尝试 100 次 API 请求，按 UTC 日计算，到上限后排队等到下一个 UTC 日。此设置限制请求次数，API 费用以 Anthropic 账单为准。网络错误和限流会退避重试，持续失败会写入发件箱。 [Claude 模型列表](https://platform.claude.com/docs/en/models/overview) · [Messages API](https://platform.claude.com/docs/en/api/messages/create)
+默认模型为 `claude-sonnet-5-5`。可在配置中修改模型和 API 版本。单个任务默认最多调用 Claude 6 轮。对话任务每轮最多输出 4,096 tokens（`ALWAYSON_MAX_TOKENS`）。GitHub 任务每轮最多输出 16,000 tokens（`ALWAYSON_GITHUB_MAX_TOKENS`），effort 默认为 `medium`（`ALWAYSON_GITHUB_EFFORT`，可选 low、medium、high、xhigh、max；留空则使用模型默认值）。思考也计入输出上限，上限太小会导致任务以 `max_tokens` 失败。安装脚本不会覆盖已有的 `/etc/alwayson/alwayson.conf`，升级时请手动把原来的 `ALWAYSON_MAX_TOKENS=1536` 调高。每日最多尝试 100 次 API 请求，按 UTC 日计算，到上限后排队等到下一个 UTC 日。此设置限制请求次数，API 费用以 Anthropic 账单为准。网络错误、5xx 和限流按约 30 秒、2 分钟、8 分钟、32 分钟、1 小时退避重试，一个任务最多尝试 6 次；参数错误或鉴权失败不重试。持续失败会写入发件箱。 [Claude 模型列表](https://platform.claude.com/docs/en/models/overview) · [Messages API](https://platform.claude.com/docs/en/api/messages/create)
+
+**告警**默认关闭。在 `/etc/alwayson/alwayson.conf` 里设置 `ALWAYSON_NOTIFY_URL`（必须是 https 地址，例如一个 ntfy 主题），然后 `sudo systemctl restart alwayson` 生效。开启后，worker 每 30 秒把新的 `error`、`warning`、`approval` 发件箱消息以纯文本 POST 到这个地址，发送失败会在下次重试。消息内容会经过该第三方服务。配置错误（密钥为空、参数无效）时，worker 以退出码 3 停止，不再无限重启，并触发 `alwayson-alert.service` 发送一条停机通知。网络或数据库这类临时故障仍会每 10 秒自动重启。可以用 `sudo alwayson notify '测试'` 检查通道是否通畅。
 
 用 `sudo alwayson retry EVENT_ID` 让失败任务从 checkpoint 继续。改了模型、轮数或输出上限后，如需用新配置从第一轮重跑，请加 `--fresh`。用 `sudo alwayson cancel EVENT_ID` 取消排队中或失败的任务。
 

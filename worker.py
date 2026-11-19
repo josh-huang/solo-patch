@@ -4,10 +4,14 @@ import http.client
 import json
 import logging
 import os
+import random
 import re
 import signal
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
+
+import psycopg2
 
 import store
 
@@ -106,7 +110,9 @@ def get_api_key():
 
 def call_claude(api_key, version, request):
     # Use one fixed TLS endpoint. HTTP redirects and environment proxies are never followed.
-    connection = http.client.HTTPSConnection("api.anthropic.com", timeout=90)
+    # Non-streaming: the read blocks for the whole generation, so allow time in proportion to max_tokens.
+    timeout = max(90, request["max_tokens"] // 40)
+    connection = http.client.HTTPSConnection("api.anthropic.com", timeout=timeout)
     try:
         connection.request("POST", "/v1/messages", body=store.dumps(request).encode("utf-8"), headers={
             "anthropic-version": version, "content-type": "application/json",
@@ -127,6 +133,7 @@ def call_claude(api_key, version, request):
                 header = (response.getheader("retry-after") or "").strip()
                 delay = min(int(header), 3600) if header.isdecimal() and len(header) <= 7 else 0
             raise ApiError(f"Anthropic API HTTP {response.status}。{hint}", delay)
+        request_id = response.getheader("request-id")
         raw = response.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, http.client.HTTPException) as exc:
         raise ApiError(f"连接 Anthropic API 失败（{type(exc).__name__}）。", 0) from exc
@@ -138,6 +145,7 @@ def call_claude(api_key, version, request):
         result = json.loads(raw)
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             store.dumps(result).encode("utf-8")
+            result["_request_id"] = request_id
             return result
     except (ValueError, RecursionError):
         pass
@@ -250,13 +258,22 @@ def consume(db, state, event, result, last_round):
     raise ApiError("Claude 返回了当前运行器无法处理的结束状态。")
 
 
-def metered_call(db, config, call, version, request):
+def metered_call(db, config, call, version, request, event_id):
     day = store.utc_day(store.now())
     if not store.reserve_request(db, day, config["daily_requests"]):
         raise QuotaExhausted
+    started = time.monotonic()
     result = call(version, request)
-    if isinstance(result.get("usage"), dict):
-        store.add_usage(db, day, result["usage"])
+    latency_ms = int((time.monotonic() - started) * 1000)
+    store.add_usage(db, day, result.get("usage"))
+    store.add_llm_call(db, event_id, request["model"], result, latency_ms, store.now())
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    LOG.info(
+        "llm event=%s stop=%s in=%s out=%s cache_read=%s cache_write=%s ms=%s request_id=%s",
+        event_id, result.get("stop_reason"), usage.get("input_tokens"), usage.get("output_tokens"),
+        usage.get("cache_read_input_tokens"), usage.get("cache_creation_input_tokens"), latency_ms,
+        result.get("_request_id"),
+    )
     return result
 
 
@@ -274,10 +291,11 @@ def run_event(db, event, config, call, stopping=lambda: False):
         request = {
             "model": state["model"], "max_tokens": state["max_tokens"],
             "system": state["system"], "messages": state["messages"], "tools": TOOLS,
+            "cache_control": {"type": "ephemeral"},
         }
         if last_round:
             request["tool_choice"] = {"type": "none"}
-        result = metered_call(db, config, call, state["api_version"], request)
+        result = metered_call(db, config, call, state["api_version"], request, event["id"])
         consume(db, state, event, result, last_round)
         state["rounds"] += 1
         store.save_checkpoint(db, event["id"], state, store.now())
@@ -285,19 +303,31 @@ def run_event(db, event, config, call, stopping=lambda: False):
     return True
 
 
-def serve(db):
-    import github_tasks
-
+def load_config():
     config = {
         "model": key_value(os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)),
         "api_version": os.environ.get("ANTHROPIC_API_VERSION", API_VERSION),
-        "max_tokens": env_number("ALWAYSON_MAX_TOKENS", 1536, 256, 8192),
+        "max_tokens": env_number("ALWAYSON_MAX_TOKENS", 4096, 256, 32000),
         "max_rounds": env_number("ALWAYSON_MAX_ROUNDS", 6, 2, 12),
         "daily_requests": env_number("ALWAYSON_DAILY_REQUESTS", 100, 1, 10000),
+        # Thinking tokens count toward max_tokens, and a patch carries old and new text.
+        "github_max_tokens": env_number("ALWAYSON_GITHUB_MAX_TOKENS", 16000, 1024, 32000),
+        "github_effort": os.environ.get("ALWAYSON_GITHUB_EFFORT", "medium").strip(),
     }
+    if config["github_effort"] not in ("", "low", "medium", "high", "xhigh", "max"):
+        raise ValueError("ALWAYSON_GITHUB_EFFORT 应为 low、medium、high、xhigh、max 或留空")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", config["api_version"]):
         raise ValueError("ANTHROPIC_API_VERSION 需要 YYYY-MM-DD")
-    api_key = get_api_key()
+    return config, get_api_key(), notify_url_value()
+
+
+def serve(db):
+    try:
+        config, api_key, notify_url = load_config()
+    except ValueError as exc:
+        # Exit 3 = configuration error: systemd stops restarting (RestartPreventExitStatus=3) and alerts.
+        LOG.error("配置错误：%s", exc)
+        raise SystemExit(3) from exc
     if not db.execute("SELECT pg_try_advisory_lock(349811, 1) AS held").fetchone()["held"]:
         raise ValueError("此数据库已有常驻 worker")
     stopping = False
@@ -309,29 +339,92 @@ def serve(db):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     store.recover(db, store.now())
-    LOG.info("worker started model=%s daily_requests=%s", config["model"], config["daily_requests"])
+    LOG.info("worker started model=%s daily_requests=%s notify=%s",
+             config["model"], config["daily_requests"], bool(notify_url))
+    next_notify = 0.0
     while not stopping:
+        if notify_url and time.monotonic() >= next_notify:
+            dispatch_notifications(db, notify_url, send_notification)
+            next_notify = time.monotonic() + 30
         store.tick(db, store.now())
         event = store.claim(db, store.now())
         if event is None:
             time.sleep(2)
             continue
-        try:
-            run = github_tasks.run_event if event["kind"] == "github" else run_event
-            finished = run(
-                db, event, config, lambda version, request: call_claude(api_key, version, request),
-                lambda: stopping,
-            )
-            if not finished:
-                store.release_on_shutdown(db, event, store.now())
-            else:
-                LOG.info("event=%s done", event["id"])
-        except QuotaExhausted:
-            store.postpone_for_quota(db, event, store.now())
-            LOG.info("event=%s paused for UTC daily quota", event["id"])
-        except ApiError as exc:
-            delay = None if exc.retry_after is None else max(exc.retry_after, 15 * 2 ** (event["attempts"] - 1))
-            with store.transaction(db):
-                store.record_failure(db, event, str(exc), store.now(), delay)
-            LOG.warning("event=%s attempt=%s %s", event["id"], event["attempts"], exc)
+        process_event(
+            db, event, config, lambda version, request: call_claude(api_key, version, request),
+            lambda: stopping,
+        )
     LOG.info("worker stopped")
+
+
+def notify_url_value():
+    url = os.environ.get("ALWAYSON_NOTIFY_URL", "").strip()
+    if url and (urlsplit(url).scheme != "https" or not urlsplit(url).hostname):
+        raise ValueError("ALWAYSON_NOTIFY_URL 需要 https:// 开头的完整地址，或留空关闭通知")
+    return url
+
+
+def send_notification(url, text):
+    # Plain-text POST (ntfy-style). Fixed host, no redirects or environment proxies, like call_claude.
+    parts = urlsplit(url)
+    connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=15)
+    try:
+        connection.request("POST", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
+                           body=text.encode("utf-8"),
+                           headers={"content-type": "text/plain; charset=utf-8", "user-agent": "SoloPatch"})
+        status = connection.getresponse().status
+    finally:
+        connection.close()
+    if not 200 <= status < 300:
+        raise OSError(f"通知地址返回 HTTP {status}")
+
+
+def dispatch_notifications(db, url, send):
+    """Push new error, warning and approval outbox rows; the cursor only advances after a successful send."""
+    row = db.execute("SELECT value FROM settings WHERE key = 'notified_outbox_id'").fetchone()
+    if row is None:
+        # First run with notifications on: start from now instead of replaying old history.
+        latest = db.execute("SELECT COALESCE(MAX(id), 0) AS id FROM outbox").fetchone()["id"]
+        db.execute("INSERT INTO settings(key, value) VALUES ('notified_outbox_id', %s)", (str(latest),))
+        return
+    rows = db.execute(
+        """SELECT id, session, kind, body FROM outbox WHERE id > %s
+           AND kind IN ('error', 'warning', 'approval') ORDER BY id LIMIT 20""",
+        (int(row["value"]),),
+    ).fetchall()
+    for item in rows:
+        try:
+            send(url, f"[SoloPatch/{item['session']}] {item['kind']}: {item['body'][:1500]}")
+        except (OSError, http.client.HTTPException) as exc:
+            LOG.warning("notification failed outbox=%s %s", item["id"], exc)
+            return
+        db.execute("UPDATE settings SET value = %s WHERE key = 'notified_outbox_id'", (str(item["id"]),))
+
+
+def process_event(db, event, config, call, stopping):
+    import github_tasks
+
+    try:
+        run = github_tasks.run_event if event["kind"] == "github" else run_event
+        if not run(db, event, config, call, stopping):
+            store.release_on_shutdown(db, event, store.now())
+        else:
+            LOG.info("event=%s done", event["id"])
+    except QuotaExhausted:
+        store.postpone_for_quota(db, event, store.now())
+        LOG.info("event=%s paused for UTC daily quota", event["id"])
+    except ApiError as exc:
+        # Transient errors only (retry_after is set): 30s, 2m, 8m, 32m, 1h with jitter, so a short outage is ridden out.
+        backoff = min(3600, 30 * 4 ** (event["attempts"] - 1)) * random.uniform(1.0, 1.2)
+        delay = None if exc.retry_after is None else max(exc.retry_after, int(backoff))
+        with store.transaction(db):
+            store.record_failure(db, event, str(exc), store.now(), delay)
+        LOG.warning("event=%s attempt=%s %s", event["id"], event["attempts"], exc)
+    except psycopg2.Error:
+        # The connection may be gone; let systemd restart the process and recover() requeue the event.
+        raise
+    except Exception:
+        LOG.exception("event=%s crashed", event["id"])
+        with store.transaction(db):
+            store.record_failure(db, event, "运行时内部错误，详见 journalctl -u alwayson。", store.now())

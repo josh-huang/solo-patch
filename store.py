@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
 DEFAULT_DSN = "dbname=alwayson user=alwayson host=/var/run/postgresql"
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 6
 MAX_TEXT = 8000
 MAX_INTERVAL = 365 * 86400
 MAX_TIMERS = 64
@@ -57,9 +57,19 @@ CREATE TABLE IF NOT EXISTS github_issues (
     repo TEXT NOT NULL,
     issue BIGINT NOT NULL,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('skipped', 'published')),
+    status TEXT NOT NULL CHECK (status IN ('skipped', 'published', 'failed')),
     pr_url TEXT,
     PRIMARY KEY (repo, issue)
+);
+ALTER TABLE github_issues ADD COLUMN IF NOT EXISTS failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE github_issues DROP CONSTRAINT IF EXISTS github_issues_status_check;
+ALTER TABLE github_issues ADD CONSTRAINT github_issues_status_check
+    CHECK (status IN ('skipped', 'published', 'failed'));
+CREATE TABLE IF NOT EXISTS github_verified (
+    repo TEXT NOT NULL,
+    uid BIGINT NOT NULL,
+    sha TEXT NOT NULL,
+    PRIMARY KEY (repo, uid, sha)
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -99,6 +109,27 @@ CREATE TABLE IF NOT EXISTS usage (
     requests INTEGER NOT NULL DEFAULT 0,
     input_tokens BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id BIGINT NOT NULL REFERENCES events(id),
+    model TEXT NOT NULL,
+    stop_reason TEXT,
+    input_tokens BIGINT NOT NULL,
+    output_tokens BIGINT NOT NULL,
+    cache_creation_input_tokens BIGINT NOT NULL,
+    cache_read_input_tokens BIGINT NOT NULL,
+    request_id TEXT,
+    latency_ms INTEGER NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS llm_calls_event ON llm_calls(event_id);
+CREATE TABLE IF NOT EXISTS github_calls (
+    event_id BIGINT NOT NULL REFERENCES events(id),
+    endpoint TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (event_id, endpoint, status)
 );
 """
 
@@ -265,6 +296,25 @@ def record_failure(db, event, message, timestamp, retry_delay=None):
             (timestamp, message, event["id"]),
         )
         emit(db, event, "error", f"任务 #{event['id']} 失败。{message}", timestamp)
+        if event["kind"] == "github":
+            mark_issue_failed(db, event["id"])
+
+
+def mark_issue_failed(db, event_id):
+    # Remember failures per issue so one bad issue cannot block the patrol forever.
+    state = load_checkpoint(db, event_id)
+    if not state or "issue" not in state:
+        return
+    db.execute(
+        """INSERT INTO github_issues(repo, issue, fingerprint, status, failures) VALUES (%s, %s, %s, 'failed', 1)
+           ON CONFLICT(repo, issue) DO UPDATE SET
+               failures = CASE WHEN github_issues.status = 'failed'
+                   AND github_issues.fingerprint = excluded.fingerprint
+                   THEN github_issues.failures + 1 ELSE 1 END,
+               fingerprint = excluded.fingerprint, status = 'failed'
+           WHERE github_issues.status <> 'published'""",
+        (state["settings"]["repo"], state["issue"], state["fingerprint"]),
+    )
 
 
 def recover(db, timestamp):
@@ -294,15 +344,37 @@ def reserve_request(db, day, limit):
         return bool(cursor.rowcount)
 
 
-def add_usage(db, day, usage):
-    def tokens(key):
-        value = usage.get(key, 0)
-        return value if type(value) is int and 0 <= value <= 10_000_000 else 0
+def usage_tokens(usage, key):
+    value = usage.get(key, 0) if isinstance(usage, dict) else 0
+    return value if type(value) is int and 0 <= value <= 10_000_000 else 0
 
+
+def add_usage(db, day, usage):
     db.execute(
         "UPDATE usage SET input_tokens = input_tokens + %s, output_tokens = output_tokens + %s WHERE day = %s",
-        (tokens("input_tokens"), tokens("output_tokens"), day),
+        (usage_tokens(usage, "input_tokens"), usage_tokens(usage, "output_tokens"), day),
     )
+
+
+def add_llm_call(db, event_id, model, result, latency_ms, timestamp):
+    usage = result.get("usage")
+    db.execute(
+        """INSERT INTO llm_calls(event_id, model, stop_reason, input_tokens, output_tokens,
+               cache_creation_input_tokens, cache_read_input_tokens, request_id, latency_ms, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (event_id, model, str(result.get("stop_reason"))[:40], usage_tokens(usage, "input_tokens"),
+         usage_tokens(usage, "output_tokens"), usage_tokens(usage, "cache_creation_input_tokens"),
+         usage_tokens(usage, "cache_read_input_tokens"), result.get("_request_id"), latency_ms, timestamp),
+    )
+
+
+def add_github_calls(db, event_id, calls):
+    for (endpoint, status), count in calls.items():
+        db.execute(
+            """INSERT INTO github_calls(event_id, endpoint, status, count) VALUES (%s, %s, %s, %s)
+               ON CONFLICT(event_id, endpoint, status) DO UPDATE SET count = github_calls.count + excluded.count""",
+            (event_id, endpoint, status, count),
+        )
 
 
 def load_checkpoint(db, event_id):
@@ -325,7 +397,7 @@ def save_run(db, event, reply, progress, proposals, timestamp, github_result=Non
                 """INSERT INTO github_issues(repo, issue, fingerprint, status, pr_url)
                    VALUES (%s, %s, %s, %s, %s)
                    ON CONFLICT(repo, issue) DO UPDATE SET fingerprint = excluded.fingerprint,
-                       status = excluded.status, pr_url = excluded.pr_url""",
+                       status = excluded.status, pr_url = excluded.pr_url, failures = 0""",
                 github_result,
             )
         if progress is not None:
@@ -348,6 +420,20 @@ def save_run(db, event, reply, progress, proposals, timestamp, github_result=Non
             (timestamp, reply, event["id"]),
         )
         db.execute("DELETE FROM checkpoints WHERE event_id = %s", (event["id"],))
+
+
+def load_verified_heads(db, repo):
+    rows = db.execute("SELECT uid, sha FROM github_verified WHERE repo = %s", (repo,)).fetchall()
+    return {(row["uid"], row["sha"]) for row in rows}
+
+
+def save_verified_heads(db, repo, heads):
+    # A verified head implies its whole history was checked, so later runs only walk new heads.
+    for uid, sha in heads:
+        db.execute(
+            "INSERT INTO github_verified(repo, uid, sha) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            (repo, uid, sha),
+        )
 
 
 def put_memory(db, key, value, timestamp):

@@ -5,3 +5,4 @@ __pycache__/
 *.dump
 anthropic_api_key
 github_token
+.venv/
