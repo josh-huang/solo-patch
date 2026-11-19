@@ -71,6 +71,8 @@ sudo alwayson approvals
 
 建好或升级服务后，在 GitHub 创建一个 **fine-grained personal access token**。Resource owner 选择你自己的个人账号，Repository access 只选择目标仓库。Repository permissions 选 `Issues: Read-only`、`Contents: Read and write`、`Pull requests: Read and write`，`Metadata: Read-only` 会默认提供。请确认目标仓库的 GitHub 套餐支持 Draft PR。 [GitHub Token 文档](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) · [Draft PR API](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)
 
+`Contents: Read and write` 也允许直接推送默认分支。程序只会创建 `alwayson/*` 分支，但为了防止 Token 泄漏或程序缺陷造成破坏，建议在仓库 Settings → Rules → Rulesets 里给默认分支加一条规则：禁止直接推送和 force push。确认 bypass 列表里没有你自己，否则这个 Token 仍能绕过规则。
+
 ```bash
 sudoedit /etc/alwayson/github_token
 sudoedit /etc/alwayson/github.conf
@@ -118,6 +120,18 @@ sudo alwayson timers
 `checkpoints.state` 是 PostgreSQL 中的 JSONB 字段。每轮工具调用后，worker 保存 Claude 消息、工具结果、已完成轮数及暂存动作。进程重启后从已提交的 checkpoint 继续。完成时，进度、审批、回执和任务状态在一个事务内提交，该任务的临时 checkpoint 随之清理。失败任务保留 checkpoint，便于重试。
 
 如果进程在 Anthropic 收到请求后、checkpoint 提交前中断，该轮请求可能重发并再次计费。本地已提交的回执和审批不会因此重复写入。 [Anthropic《Building always-on agents》](https://claude.com/resources/articles/building-always-on-agents) · [Claude 工具调用协议](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
+
+## 运行测试
+
+测试使用嵌入式 PostgreSQL（pgserver）、脚本化的 Claude 响应和内存里的假 GitHub，不会访问 Anthropic 或 GitHub。
+
+```bash
+python3 -m uv venv .venv --python 3.12
+python3 -m uv pip install --python .venv/bin/python pgserver psycopg2-binary
+.venv/bin/python -I -m unittest discover -s tests -v
+```
+
+用 `sudo alwayson show EVENT_ID` 可以查看单个任务每次 Claude 调用的 token（包括缓存读写）、stop_reason、request-id、耗时，以及按端点统计的 GitHub 调用次数。
 
 ## 查看日志、限制用量和备份
 
