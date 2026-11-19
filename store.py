@@ -65,6 +65,12 @@ ALTER TABLE github_issues ADD COLUMN IF NOT EXISTS failures INTEGER NOT NULL DEF
 ALTER TABLE github_issues DROP CONSTRAINT IF EXISTS github_issues_status_check;
 ALTER TABLE github_issues ADD CONSTRAINT github_issues_status_check
     CHECK (status IN ('skipped', 'published', 'failed'));
+CREATE TABLE IF NOT EXISTS github_verified (
+    repo TEXT NOT NULL,
+    uid BIGINT NOT NULL,
+    sha TEXT NOT NULL,
+    PRIMARY KEY (repo, uid, sha)
+);
 CREATE TABLE IF NOT EXISTS outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     event_id BIGINT NOT NULL REFERENCES events(id),
@@ -414,6 +420,20 @@ def save_run(db, event, reply, progress, proposals, timestamp, github_result=Non
             (timestamp, reply, event["id"]),
         )
         db.execute("DELETE FROM checkpoints WHERE event_id = %s", (event["id"],))
+
+
+def load_verified_heads(db, repo):
+    rows = db.execute("SELECT uid, sha FROM github_verified WHERE repo = %s", (repo,)).fetchall()
+    return {(row["uid"], row["sha"]) for row in rows}
+
+
+def save_verified_heads(db, repo, heads):
+    # A verified head implies its whole history was checked, so later runs only walk new heads.
+    for uid, sha in heads:
+        db.execute(
+            "INSERT INTO github_verified(repo, uid, sha) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            (repo, uid, sha),
+        )
 
 
 def put_memory(db, key, value, timestamp):

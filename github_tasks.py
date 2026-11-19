@@ -230,7 +230,7 @@ def verify_personal(gh, verified):
             raise SkipRepo("无法核验默认分支。")
         pages = 0
         for head in dict.fromkeys(heads.values()):
-            if head in verified:
+            if (uid, head) in verified:
                 continue
             page = 1
             while pages < MAX_HISTORY_PAGES:
@@ -244,7 +244,7 @@ def verify_personal(gh, verified):
                         raise SkipRepo("提交历史包含其他作者、共同作者或未关联身份。")
                 pages += 1
                 if len(history) < 100:
-                    verified.add(head)
+                    verified.add((uid, head))
                     break
                 page += 1
             else:
@@ -560,7 +560,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
 def run_github(db, gh, settings, event, config, call, stopping):
     state = store.load_checkpoint(db, event["id"])
     is_preview = event["body"] == "preview"
-    checked_heads = set()
+    checked_heads = store.load_verified_heads(db, gh.repo)
 
     def done(message, record=None):
         store.save_run(db, event, message, None, [], store.now(), github_result=record)
@@ -577,6 +577,7 @@ def run_github(db, gh, settings, event, config, call, stopping):
         return False
     try:
         default, base, uid = verify_personal(gh, checked_heads)
+        store.save_verified_heads(db, gh.repo, checked_heads)
     except SkipRepo as exc:
         return done(f"GitHub 巡检已跳过 {gh.repo}。{exc}")
     days_left = token_days_left(gh.token_expires)
@@ -633,6 +634,7 @@ def run_github(db, gh, settings, event, config, call, stopping):
 
     try:
         current = verify_personal(gh, checked_heads)[:2]
+        store.save_verified_heads(db, gh.repo, checked_heads)
     except SkipRepo as exc:
         return done(f"GitHub 发布已跳过 {gh.repo}。{exc}")
     issue_now = gh.get(f"/issues/{number}")

@@ -333,6 +333,27 @@ class GitHubFlowTest(GitHubBase):
         self.assertIn("GET /git/blobs/:id", endpoints)
         self.assertIn("GET /git/ref/heads/:branch", endpoints)
 
+    def test_verified_history_is_not_walked_again(self):
+        self.gh.issues[2] = FakeGitHub.issue(2)
+        walks = []
+        for mode in ("apply", "preview", "preview"):
+            self.gh.calls.clear()
+            self.enqueue(mode)
+            self.serve_once(Claude(patch_responses()))
+            walks.append(self.gh.calls.count(("GET", "/commits")))
+        # main, then only the new alwayson/issue-1 head, then nothing.
+        self.assertEqual(walks, [1, 1, 0])
+
+    def test_new_commit_by_someone_else_is_still_caught(self):
+        self.enqueue("preview")
+        self.serve_once(Claude(patch_responses()))
+        intruder = sha("intruder")
+        self.gh.commits[intruder] = {"parents": [self.gh.base], "tree": self.gh.tree, "author": 2}
+        self.gh.refs["main"] = intruder
+        self.enqueue("preview")
+        self.serve_once(Claude([]))
+        self.assertIn("其他作者", self.outbox()[-1])
+
     def test_kill_after_each_write_still_yields_one_pr(self):
         for point in [("POST", "/git/trees"), ("POST", "/git/commits"), ("POST", "/git/refs"), ("POST", "/pulls")]:
             with self.subTest(point=point):
