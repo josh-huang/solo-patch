@@ -303,7 +303,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
     return True
 
 
-def serve(db):
+def load_config():
     config = {
         "model": key_value(os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)),
         "api_version": os.environ.get("ANTHROPIC_API_VERSION", API_VERSION),
@@ -318,8 +318,16 @@ def serve(db):
         raise ValueError("ALWAYSON_GITHUB_EFFORT 应为 low、medium、high、xhigh、max 或留空")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", config["api_version"]):
         raise ValueError("ANTHROPIC_API_VERSION 需要 YYYY-MM-DD")
-    api_key = get_api_key()
-    notify_url = notify_url_value()
+    return config, get_api_key(), notify_url_value()
+
+
+def serve(db):
+    try:
+        config, api_key, notify_url = load_config()
+    except ValueError as exc:
+        # Exit 3 = configuration error: systemd stops restarting (RestartPreventExitStatus=3) and alerts.
+        LOG.error("配置错误：%s", exc)
+        raise SystemExit(3) from exc
     if not db.execute("SELECT pg_try_advisory_lock(349811, 1) AS held").fetchone()["held"]:
         raise ValueError("此数据库已有常驻 worker")
     stopping = False

@@ -294,8 +294,7 @@ def main():
         return 0
     except (ValueError, OSError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
-        # Exit 3 marks a worker configuration error: systemd stops restarting (RestartPreventExitStatus) and alerts.
-        return 3 if args.command == "worker" and isinstance(exc, ValueError) else 1
+        return 1
     except psycopg2.Error as exc:
         detail = exc.diag.message_primary
         message = f"数据库操作失败（SQLSTATE {exc.pgcode or '连接错误'}）。"

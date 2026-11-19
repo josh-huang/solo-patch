@@ -8,9 +8,11 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -593,9 +595,50 @@ class AlertTest(Base):
             os.environ[key] = value
         self.addCleanup(setattr, sys, "argv", sys.argv)
         sys.argv = ["alwayson", "worker"]
-        self.assertEqual(alwayson.main(), 3)
+        with self.assertRaises(SystemExit) as caught, self.assertLogs("alwayson", "ERROR"):
+            alwayson.main()
+        self.assertEqual(caught.exception.code, 3)
         sys.argv = ["alwayson", "notify", "hello"]
         self.assertEqual(alwayson.main(), 0)
+
+
+class ServeTest(Base):
+    """Runs the real worker.serve loop until the queue is empty, then stops it with SIGTERM."""
+
+    def run_serve(self, claude: Claude, env: dict) -> None:
+        for key, value in {"ANTHROPIC_API_KEY": "sk-test", **env}.items():
+            self.addCleanup(os.environ.pop, key, None)
+            os.environ[key] = value
+        os.environ.pop("CREDENTIALS_DIRECTORY", None)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+        call = mock.patch.object(worker, "call_claude", lambda key, version, request: claude(version, request))
+        sleep = mock.patch.object(worker.time, "sleep", lambda seconds: os.kill(os.getpid(), signal.SIGTERM))
+        with call, sleep, self.assertLogs("alwayson", "INFO") as logs:
+            worker.serve(self.db)
+        self.assertTrue(any("worker started" in line for line in logs.output))
+        self.assertTrue(any("worker stopped" in line for line in logs.output))
+
+    def test_serve_processes_queue_and_stops_on_sigterm(self):
+        event_id = store.enqueue(self.db, "user", "demo", "hi", store.now())
+        self.run_serve(Claude([reply([{"type": "text", "text": "好"}], "end_turn")]), {})
+        self.assertEqual(self.event(event_id)["status"], "done")
+        self.assertEqual(self.outbox(), ["好"])
+
+    def test_serve_runs_dispatcher_when_notify_url_set(self):
+        sent = []
+        with mock.patch.object(worker, "send_notification", lambda url, text: sent.append(text)):
+            self.run_serve(Claude([]), {"ALWAYSON_NOTIFY_URL": "https://ntfy.example/t"})
+        cursor = self.db.execute("SELECT value FROM settings WHERE key = 'notified_outbox_id'").fetchone()
+        self.assertIsNotNone(cursor)
+
+    def test_second_worker_is_not_a_config_error(self):
+        other = store.connect(f"dbname=t user=postgres host={HOST}")
+        self.addCleanup(other.close)
+        other.cursor().execute("SELECT pg_advisory_lock(349811, 1)")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        self.addCleanup(os.environ.pop, "ANTHROPIC_API_KEY", None)
+        self.assertRaisesRegex(ValueError, "已有常驻 worker", worker.serve, self.db)
 
 
 class StoreTest(Base):
