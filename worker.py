@@ -290,6 +290,7 @@ def run_event(db, event, config, call, stopping=lambda: False):
         request = {
             "model": state["model"], "max_tokens": state["max_tokens"],
             "system": state["system"], "messages": state["messages"], "tools": TOOLS,
+            "cache_control": {"type": "ephemeral"},
         }
         if last_round:
             request["tool_choice"] = {"type": "none"}

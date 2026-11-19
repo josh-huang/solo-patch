@@ -268,6 +268,9 @@ class GitHubFlowTest(GitHubBase):
             self.assertNotIn("tool_choice", request)
             self.assertEqual(request["max_tokens"], 16000)
             self.assertEqual(request["output_config"], {"effort": "medium"})
+            self.assertEqual(request["cache_control"], {"type": "ephemeral"})
+        first = json.loads(claude.requests[0]["messages"][0]["content"])
+        self.assertEqual(first["files"], ["README.md", "docs/guide.md"])
 
     def test_old_checkpoint_without_effort_still_resumes(self):
         claude = Claude([patch_responses()[0], Crash()])
