@@ -12,9 +12,9 @@ import signal
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 import pgserver
@@ -423,7 +423,7 @@ class GitHubFlowTest(GitHubBase):
             self.db.execute("UPDATE events SET available_at = 0 WHERE id = %s", (event_id,))
         self.assertEqual(event["attempts"], store.MAX_ATTEMPTS)
         self.assertEqual(len(delays), store.MAX_ATTEMPTS - 1)
-        for got, base in zip(delays, [30, 120, 480, 1920, 3600]):
+        for got, base in zip(delays, [30, 120, 480, 1920, 3600], strict=True):
             self.assertTrue(base <= got <= base * 1.2 + 1, (got, base))
 
     def test_max_tokens_fails_the_event(self):
