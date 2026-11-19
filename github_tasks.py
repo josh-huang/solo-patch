@@ -249,7 +249,7 @@ def verify_personal(gh, verified):
                 page += 1
             else:
                 raise SkipRepo("提交历史超过单次可完整核验的范围。")
-        return default, heads[default]
+        return default, heads[default], uid
     except GitHubError as exc:
         # Auth and access errors are operational faults (expired or revoked token), not a reason to skip quietly.
         if exc.retry_after is not None or exc.status in (401, 403, 404):
@@ -259,9 +259,12 @@ def verify_personal(gh, verified):
         raise SkipRepo("GitHub 返回的仓库归属或历史信息不完整。") from exc
 
 
-def is_eligible(issue, settings):
+def is_eligible(issue, settings, uid):
     if (issue.get("state") != "open" or "pull_request" in issue
             or issue.get("locked") or issue.get("assignee") or issue.get("assignees")):
+        return False
+    # Only the owner's own issues: anyone can open (and later edit) an issue on a public repo.
+    if (issue.get("user") or {}).get("id") != uid:
         return False
     labels = [label.get("name", "") for label in issue.get("labels", [])]
     text = (issue.get("title") or "") + "\n" + (issue.get("body") or "")
@@ -277,11 +280,11 @@ def fingerprint(issue):
     return hashlib.sha256(store.dumps(fields).encode("utf-8")).hexdigest()
 
 
-def pick_issue(db, gh, settings):
+def pick_issue(db, gh, settings, uid):
     for page in range(1, 4):
         issues = gh.get("/issues", state="open", labels=settings["label"], sort="created", direction="asc", per_page=50, page=page)
         for issue in issues:
-            if not is_eligible(issue, settings):
+            if not is_eligible(issue, settings, uid):
                 continue
             number = issue.get("number")
             if type(number) is not int or not 0 < number <= 2**63 - 1:
@@ -573,7 +576,7 @@ def run_github(db, gh, settings, event, config, call, stopping):
     if stopping():
         return False
     try:
-        default, base = verify_personal(gh, checked_heads)
+        default, base, uid = verify_personal(gh, checked_heads)
     except SkipRepo as exc:
         return done(f"GitHub 巡检已跳过 {gh.repo}。{exc}")
     days_left = token_days_left(gh.token_expires)
@@ -583,7 +586,7 @@ def run_github(db, gh, settings, event, config, call, stopping):
         raise worker.ApiError("GitHub 设置与 checkpoint 不一致，请取消任务或使用 retry --fresh。")
 
     if state is None:
-        selected = pick_issue(db, gh, settings)
+        selected = pick_issue(db, gh, settings, uid)
         if selected is None:
             return done(f"{gh.repo} 暂无符合标签 {settings['label']} 的待处理 issue。")
         issue, mark = selected
@@ -629,10 +632,10 @@ def run_github(db, gh, settings, event, config, call, stopping):
         return False
 
     try:
-        current = verify_personal(gh, checked_heads)
+        current = verify_personal(gh, checked_heads)[:2]
     except SkipRepo as exc:
         return done(f"GitHub 发布已跳过 {gh.repo}。{exc}")
     issue_now = gh.get(f"/issues/{number}")
-    if current != (state["default"], state["base"]) or not is_eligible(issue_now, settings) or fingerprint(issue_now) != state["fingerprint"]:
+    if current != (state["default"], state["base"]) or not is_eligible(issue_now, settings, uid) or fingerprint(issue_now) != state["fingerprint"]:
         return done(f"Issue #{number} 已跳过。默认分支或 issue 在生成补丁期间发生变化。")
     return published(publish(gh, state, save))

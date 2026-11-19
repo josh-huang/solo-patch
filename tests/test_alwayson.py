@@ -421,12 +421,19 @@ class GitHubFlowTest(GitHubBase):
         self.assertEqual(github_tasks.token_days_left("2020-01-01 00:00:00 +0800") < 0, True)
         self.assertIsNone(github_tasks.token_days_left(None))
 
-    def test_issue_from_another_account_is_processed(self):
+    def test_issue_from_another_account_is_ignored(self):
         self.gh.issues = {5: FakeGitHub.issue(5, author=2)}
-        claude = Claude(patch_responses())
+        claude = Claude([])
         self.enqueue("preview")
-        self.serve_once(claude)
-        self.assertEqual(self.first_issue_number(claude), 5)
+        self.assertEqual(self.serve_once(claude)["status"], "done")
+        self.assertEqual(claude.requests, [])
+        self.assertIn("暂无", self.outbox()[0])
+
+    def test_issue_reassigned_to_other_author_is_not_published(self):
+        self.gh.override[("GET", "/issues/1")] = FakeGitHub.issue(1, author=2)
+        self.enqueue()
+        self.serve_once(Claude(patch_responses()))
+        self.assertEqual(self.gh.pulls, [])
 
 
 class StubResponse:

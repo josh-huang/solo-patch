@@ -85,7 +85,7 @@ ALWAYSON_GITHUB_LABEL=agent-ready
 ALWAYSON_GITHUB_PATHS=README.md,docs/,src/,tests/
 ```
 
-在目标仓库给愿意让 Agent 处理的开放 issue 加上 `agent-ready` 标签。Agent 会从较早的候选里选择一个尚未分派的 issue。若仓库已经用 `good first issue` 标记类似任务，可以修改配置中的候选标签。
+在目标仓库给愿意让 Agent 处理的开放 issue 加上 `agent-ready` 标签。Agent 会从较早的候选里选择一个尚未分派的 issue，并且只处理由 Token 对应账号本人开的 issue（公开仓库里他人开的 issue 可能在打标签后被改写，内容会进入 prompt）。同一个 issue 在内容不变的情况下连续失败 2 次后会被暂停，编辑 issue 后恢复。若仓库已经用 `good first issue` 标记类似任务，可以修改配置中的候选标签。
 
 ```bash
 sudo alwayson github-run
