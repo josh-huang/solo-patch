@@ -356,7 +356,7 @@ class GitHubFlowTest(GitHubBase):
                 running = self.db.execute("SELECT COUNT(*) AS n FROM events WHERE status = 'running'").fetchone()
                 self.assertEqual(running["n"], 0)
 
-    def test_issue_that_keeps_failing_is_reselected(self):
+    def test_issue_that_keeps_failing_is_parked_after_two_failures(self):
         self.gh.issues[2] = FakeGitHub.issue(2)
         picked = []
         for _ in range(3):
@@ -365,7 +365,19 @@ class GitHubFlowTest(GitHubBase):
             event = self.serve_once(claude)
             self.assertEqual(event["status"], "failed")
             picked.append(self.first_issue_number(claude))
-        self.assertEqual(picked, [1, 1, 1])
+        self.assertEqual(picked, [1, 1, 2])
+        row = self.db.execute("SELECT * FROM github_issues WHERE issue = 1").fetchone()
+        self.assertEqual((row["status"], row["failures"]), ("failed", 2))
+
+    def test_failure_never_downgrades_published_issue(self):
+        self.enqueue()
+        self.serve_once(Claude(patch_responses()))
+        event_id = self.enqueue("preview")
+        event = self.claim()
+        store.save_checkpoint(self.db, event_id, {"issue": 1, "fingerprint": "x", "settings": {"repo": "me/repo"}}, 0)
+        with store.transaction(self.db):
+            store.record_failure(self.db, event, "boom", store.now())
+        self.assertEqual(self.db.execute("SELECT status FROM github_issues").fetchone()["status"], "published")
 
     def test_max_tokens_fails_the_event(self):
         claude = Claude([reply([], "max_tokens")])
@@ -412,6 +424,10 @@ class ChatTest(Base):
 
 
 class StoreTest(Base):
+    def test_init_schema_is_rerunnable(self):
+        store.init_schema(self.db)
+        store.init_schema(self.db)
+
     def test_overdue_timer_fires_once(self):
         start = store.now() - 600
         with store.transaction(self.db):

@@ -19,6 +19,7 @@ API_VERSION = "2026-03-10"
 MAX_FILE_BYTES = 20_000
 MAX_FILES_READ = 12
 MAX_HISTORY_PAGES = 30
+MAX_ISSUE_FAILURES = 2
 REPOSITORY = re.compile(r"[a-zA-Z0-9-]{1,39}/[a-zA-Z0-9_.-]{1,100}")
 SHA = re.compile(r"[a-f0-9]{40}")
 ENDPOINT_ID = re.compile(r"/(?:[a-f0-9]{40}|[0-9]+)(?=/|$)")
@@ -267,7 +268,10 @@ def pick_issue(db, gh, settings):
                 continue
             mark = fingerprint(issue)
             previous = db.execute("SELECT * FROM github_issues WHERE repo = %s AND issue = %s", (gh.repo, number)).fetchone()
-            if previous and (previous["status"] == "published" or previous["fingerprint"] == mark):
+            if previous and previous["status"] == "published":
+                continue
+            if previous and previous["fingerprint"] == mark and (
+                    previous["status"] == "skipped" or previous["failures"] >= MAX_ISSUE_FAILURES):
                 continue
             return issue, mark
         if len(issues) < 50:

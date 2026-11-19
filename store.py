@@ -57,10 +57,14 @@ CREATE TABLE IF NOT EXISTS github_issues (
     repo TEXT NOT NULL,
     issue BIGINT NOT NULL,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('skipped', 'published')),
+    status TEXT NOT NULL CHECK (status IN ('skipped', 'published', 'failed')),
     pr_url TEXT,
     PRIMARY KEY (repo, issue)
 );
+ALTER TABLE github_issues ADD COLUMN IF NOT EXISTS failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE github_issues DROP CONSTRAINT IF EXISTS github_issues_status_check;
+ALTER TABLE github_issues ADD CONSTRAINT github_issues_status_check
+    CHECK (status IN ('skipped', 'published', 'failed'));
 CREATE TABLE IF NOT EXISTS outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     event_id BIGINT NOT NULL REFERENCES events(id),
@@ -286,6 +290,25 @@ def record_failure(db, event, message, timestamp, retry_delay=None):
             (timestamp, message, event["id"]),
         )
         emit(db, event, "error", f"任务 #{event['id']} 失败。{message}", timestamp)
+        if event["kind"] == "github":
+            mark_issue_failed(db, event["id"])
+
+
+def mark_issue_failed(db, event_id):
+    # Remember failures per issue so one bad issue cannot block the patrol forever.
+    state = load_checkpoint(db, event_id)
+    if not state or "issue" not in state:
+        return
+    db.execute(
+        """INSERT INTO github_issues(repo, issue, fingerprint, status, failures) VALUES (%s, %s, %s, 'failed', 1)
+           ON CONFLICT(repo, issue) DO UPDATE SET
+               failures = CASE WHEN github_issues.status = 'failed'
+                   AND github_issues.fingerprint = excluded.fingerprint
+                   THEN github_issues.failures + 1 ELSE 1 END,
+               fingerprint = excluded.fingerprint, status = 'failed'
+           WHERE github_issues.status <> 'published'""",
+        (state["settings"]["repo"], state["issue"], state["fingerprint"]),
+    )
 
 
 def recover(db, timestamp):
@@ -368,7 +391,7 @@ def save_run(db, event, reply, progress, proposals, timestamp, github_result=Non
                 """INSERT INTO github_issues(repo, issue, fingerprint, status, pr_url)
                    VALUES (%s, %s, %s, %s, %s)
                    ON CONFLICT(repo, issue) DO UPDATE SET fingerprint = excluded.fingerprint,
-                       status = excluded.status, pr_url = excluded.pr_url""",
+                       status = excluded.status, pr_url = excluded.pr_url, failures = 0""",
                 github_result,
             )
         if progress is not None:
