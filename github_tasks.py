@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlencode
 
@@ -76,6 +77,7 @@ class GitHub:
         self.repo = repo
         self.token = token
         self.calls = {}
+        self.token_expires = None
 
     def request(self, method, path, params=None, data=None):
         status = 0
@@ -109,12 +111,16 @@ class GitHub:
                 retry = (response.getheader("retry-after") or "").strip()
                 if retry.isascii() and retry.isdecimal() and len(retry) <= 8:
                     delay = min(int(retry), 3600)
-                elif response.status in (408, 409, 429) or response.status >= 500:
-                    delay = 0
-                elif response.status == 403 and response.getheader("x-ratelimit-remaining") == "0":
+                elif response.status in (403, 429) and response.getheader("x-ratelimit-remaining") == "0":
                     reset = response.getheader("x-ratelimit-reset") or ""
                     delay = min(max(int(reset) - store.now(), 60), 3600) if reset.isascii() and reset.isdecimal() and len(reset) <= 12 else 3600
+                elif response.status == 429 or (response.status == 403 and b"rate limit" in response.read(4096).lower()):
+                    # GitHub asks for at least one minute before retrying a secondary rate limit.
+                    delay = 60
+                elif response.status in (408, 409) or response.status >= 500:
+                    delay = 0
                 raise GitHubError(response.status, delay)
+            self.token_expires = response.getheader("github-authentication-token-expiration")
             limit = 9_000_000 if path.startswith("/git/trees/") else 4_000_000
             raw = response.read(limit + 1)
             if len(raw) > limit:
@@ -167,6 +173,19 @@ def get_github_token():
     if not re.fullmatch(r"github_pat_[a-zA-Z0-9_]+", token):
         raise worker.ApiError("请在 /etc/alwayson/github_token 写入 GitHub fine-grained personal access token。")
     return token
+
+
+def token_days_left(header):
+    """Days until the token expires, from GitHub's expiration header (None when absent or unparsable)."""
+    for pattern in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S UTC"):
+        try:
+            stamp = datetime.strptime((header or "").strip(), pattern)
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return int((stamp.timestamp() - store.now()) // 86400)
+    return None
 
 
 def sha_value(value):
@@ -232,7 +251,8 @@ def verify_personal(gh, verified):
                 raise SkipRepo("提交历史超过单次可完整核验的范围。")
         return default, heads[default]
     except GitHubError as exc:
-        if exc.retry_after is not None:
+        # Auth and access errors are operational faults (expired or revoked token), not a reason to skip quietly.
+        if exc.retry_after is not None or exc.status in (401, 403, 404):
             raise
         raise SkipRepo(f"GitHub 返回 HTTP {exc.status}，无法确认仓库仅由本人维护。") from exc
     except (AttributeError, KeyError, TypeError) as exc:
@@ -556,6 +576,9 @@ def run_github(db, gh, settings, event, config, call, stopping):
         default, base = verify_personal(gh, checked_heads)
     except SkipRepo as exc:
         return done(f"GitHub 巡检已跳过 {gh.repo}。{exc}")
+    days_left = token_days_left(gh.token_expires)
+    if days_left is not None and days_left < 7:
+        store.emit(db, event, "warning", f"GitHub Token 将在 {max(days_left, 0)} 天内过期，请尽快更换。", store.now())
     if state is not None and (state["version"] != 1 or state["settings"] != settings):
         raise worker.ApiError("GitHub 设置与 checkpoint 不一致，请取消任务或使用 retry --fresh。")
 

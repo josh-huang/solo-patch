@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -100,6 +101,7 @@ class FakeGitHub:
         self.fail: dict = {}
         self.crash_after = None
         self.counter = 0
+        self.token_expires = None
 
     @staticmethod
     def issue(number: int, author: int = UID) -> dict:
@@ -115,6 +117,7 @@ class FakeGitHub:
 
     def handle(self, gh, method: str, path: str, params=None, data=None):
         self.calls.append((method, path))
+        gh.token_expires = self.token_expires
         for (fail_method, prefix), status in self.fail.items():
             if method == fail_method and path.startswith(prefix):
                 raise github_tasks.GitHubError(status)
@@ -384,12 +387,21 @@ class GitHubFlowTest(GitHubBase):
         self.enqueue("preview")
         self.assertEqual(self.serve_once(claude)["status"], "failed")
 
-    def test_expired_token_looks_like_a_skip(self):
+    def test_expired_token_fails_the_event(self):
         self.gh.fail[("GET", "/user")] = 401
         self.enqueue()
         event = self.serve_once(Claude([]))
-        self.assertEqual(event["status"], "done")
-        self.assertIn("跳过", self.outbox()[0])
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("HTTP 401", self.outbox("error")[0])
+
+    def test_token_close_to_expiry_warns(self):
+        soon = datetime.fromtimestamp(store.now() + 3 * 86400, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.gh.token_expires = soon
+        self.enqueue("preview")
+        self.serve_once(Claude(patch_responses()))
+        self.assertEqual(len(self.outbox("warning")), 1)
+        self.assertEqual(github_tasks.token_days_left("2020-01-01 00:00:00 +0800") < 0, True)
+        self.assertIsNone(github_tasks.token_days_left(None))
 
     def test_issue_from_another_account_is_processed(self):
         self.gh.issues = {5: FakeGitHub.issue(5, author=2)}
@@ -397,6 +409,48 @@ class GitHubFlowTest(GitHubBase):
         self.enqueue("preview")
         self.serve_once(claude)
         self.assertEqual(self.first_issue_number(claude), 5)
+
+
+class StubResponse:
+    def __init__(self, status: int, headers: dict, body: bytes = b"{}"):
+        self.status, self.headers, self.body = status, headers, body
+
+    def getheader(self, name: str):
+        return self.headers.get(name)
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+
+class GitHubSendTest(unittest.TestCase):
+    def retry_after(self, status: int, headers: dict, body: bytes = b"{}"):
+        response = StubResponse(status, headers, body)
+
+        class Connection:
+            def __init__(self, *args, **kwargs): pass
+            def request(self, *args, **kwargs): pass
+            def getresponse(self): return response
+            def close(self): pass
+
+        original = github_tasks.http.client.HTTPSConnection
+        github_tasks.http.client.HTTPSConnection = Connection
+        try:
+            github_tasks.GitHub("me/repo", "t").send("GET", "/user")
+        except github_tasks.GitHubError as exc:
+            return exc.retry_after
+        finally:
+            github_tasks.http.client.HTTPSConnection = original
+        raise AssertionError("expected GitHubError")
+
+    def test_status_to_retry_mapping(self):
+        self.assertEqual(self.retry_after(403, {}, b'{"message":"You have exceeded a secondary rate limit"}'), 60)
+        self.assertIsNone(self.retry_after(403, {}, b'{"message":"Resource not accessible by personal access token"}'))
+        self.assertEqual(self.retry_after(429, {}), 60)
+        self.assertEqual(self.retry_after(403, {"retry-after": "30"}), 30)
+        reset = str(store.now() + 600)
+        self.assertGreaterEqual(self.retry_after(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}), 590)
+        self.assertEqual(self.retry_after(502, {}), 0)
+        self.assertIsNone(self.retry_after(401, {}))
 
 
 class ChatTest(Base):
